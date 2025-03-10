@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Support running cargo test / run / bench on OpenHarmony devices."
+repository = "https://github.com/openharmony-rs/ohos-test-runner"
 
 [dependencies]
 rexpect = "0.6"
