@@ -152,6 +152,7 @@ fn main() -> anyhow::Result<()> {
     let mut hdc_cmd = Command::new("hdc");
     hdc_cmd
         .arg("shell")
+        .args(["cd", TEST_BIN_DIR, ";"].iter())
         .arg(on_device_bin_path)
         .args(remaining_args)
         .args([";", "echo", "$?", ">", &exit_code_file].iter());
