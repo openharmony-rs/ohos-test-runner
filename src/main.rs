@@ -18,6 +18,7 @@ use rexpect::spawn;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use log::debug;
 
 const TEST_BIN_DIR: &str = "/data/local/tmp/ohos-test-runner";
 const HDC_ERROR_NEED_CONNECT_KEY: &str = "[Fail]ExecuteCommand need connect-key?";
@@ -53,7 +54,7 @@ fn send_bin_to_device(
     assert!(res.status.success());
     if !res.stdout.starts_with(b"FileTransfer finish") {
         // Don't bail for now, we still verify the sha256 hash below anyway.
-        eprintln!("Unexpected output from hdc. File transfer may have failed.");
+        log::warn!("Unexpected output from hdc. File transfer may have failed.");
     }
 
     let cmd = format!("chmod +x {on_device_bin_path}");
@@ -73,7 +74,7 @@ fn send_bin_to_device(
     std::io::copy(&mut file, &mut hasher).context("Failed to hash the binary on the host")?;
     let hash = hasher.finalize();
     let hash = hex::encode(hash);
-    eprintln!("The hash is {hash:?}");
+    debug!("The hash is {hash:?}");
 
     p.send_line(format!("sha256sum {on_device_bin_path}").as_str())
         .context("hdc shell prompt disconnected?")?;
@@ -83,7 +84,7 @@ fn send_bin_to_device(
         .context("Couldn't find sha256sum output")?;
     // First character is \n
     let on_device_hash = &on_device_hash_line[1..65];
-    eprintln!("The hash on the device is {on_device_hash}");
+    debug!("The hash on the device is {on_device_hash}");
     if on_device_hash != hash.as_str() {
         bail!(
             "Hash mismatch. Local sha256sum: {hash}. On device sha256sum output: {on_device_hash}"
@@ -98,7 +99,7 @@ fn send_bin_to_device(
 }
 
 fn main() -> anyhow::Result<()> {
-    eprintln!("Hi, this is the custom target runner");
+    env_logger::init();
     let mut args = std::env::args_os();
     let bin_path = args.nth(1).unwrap();
     // potentially remaining args should be passed through to the test executable.
@@ -108,12 +109,11 @@ fn main() -> anyhow::Result<()> {
     assert!(bin_path.exists(), "Binary not found");
     let bin_name = bin_path.file_name().expect("Test bin must have a filename");
     let on_device_bin_path = format!("{TEST_BIN_DIR}/{}", bin_name.to_str().expect("utf-8"));
-    eprintln!("Bin_path: {:?}", bin_path);
+    debug!("Bin_path: {:?}", bin_path);
 
     let mut p = spawn("hdc list targets", Some(1000)).expect("Failed to spawn hdc list");
     let targets = p.exp_eof().expect("Failed to run hdc list");
     if targets.contains("[Empty]") {
-        eprintln!("No hdc devices found. Connect a device or start an emulator!");
         bail!("No HDC devices found");
     } else {
         let lines = targets.trim().lines().collect::<Vec<&str>>();
@@ -142,7 +142,7 @@ fn main() -> anyhow::Result<()> {
         other => bail!("Unexpected hdc shell prompt: {}", other),
     };
 
-    eprintln!("HDC shell prompt regex: `{}`", prompt_regex);
+    debug!("HDC shell prompt regex: `{}`", prompt_regex);
     send_bin_to_device(p, bin_path, &on_device_bin_path, prompt_regex)
         .context("Failed to send binary to device")?;
 
