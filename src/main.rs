@@ -111,8 +111,8 @@ fn main() -> anyhow::Result<()> {
     let on_device_bin_path = format!("{TEST_BIN_DIR}/{}", bin_name.to_str().expect("utf-8"));
     debug!("Bin_path: {:?}", bin_path);
 
-    let mut p = spawn("hdc list targets", Some(1000)).expect("Failed to spawn hdc list");
-    let targets = p.exp_eof().expect("Failed to run hdc list");
+    let mut p = spawn("hdc list targets", Some(5000)).expect("Failed to spawn hdc");
+    let targets = p.exp_eof().expect("Failed to run `hdc list targets`");
     if targets.contains("[Empty]") {
         bail!("No HDC devices found");
     } else {
