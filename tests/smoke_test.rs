@@ -4,8 +4,6 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_OHOS_TARGET: &str = "aarch64-unknown-linux-ohos";
-const FIXTURE_PACKAGE_NAME: &str = "ohos-test-runner-smoke-fixture";
-const FIXTURE_TEST_NAME: &str = "ohos_test_runner_md5_fallback_smoke_regression";
 const FIXTURE_PASSING_CASE: &str = "smoke_passes";
 const FIXTURE_FAILING_CASE: &str = "smoke_fails";
 const EXPECTED_MD5_LOG: &str = "The md5sum hash on the device is";
@@ -64,6 +62,11 @@ fn run_fixture_test_case(
     let linker = std::env::var(&linker_env_var).map_err(|_| {
         format!("required linker environment variable `{linker_env_var}` is not set")
     })?;
+    let fixture_test_name = project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}_fixture"))
+        .ok_or("failed to derive fixture test name from temp project directory")?;
 
     let run = Command::new("cargo")
         .arg("test")
@@ -71,7 +74,7 @@ fn run_fixture_test_case(
         .arg("--target")
         .arg(&target)
         .arg("--test")
-        .arg(FIXTURE_TEST_NAME)
+        .arg(&fixture_test_name)
         .arg("--")
         .arg(test_filter)
         .arg("--nocapture")
@@ -97,16 +100,24 @@ fn assert_expected_hash_kind(run: &Output) {
 
 fn write_smoke_test_fixture(project_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(project_dir.join("tests"))?;
+    let fixture_package_name = project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}-fixture"))
+        .ok_or("failed to derive fixture package name from temp project directory")?;
+    let fixture_test_name = project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}_fixture"))
+        .ok_or("failed to derive fixture test name from temp project directory")?;
     fs::write(
         project_dir.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"{FIXTURE_PACKAGE_NAME}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+            "[package]\nname = \"{fixture_package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
         ),
     )?;
     fs::write(
-        project_dir
-            .join("tests")
-            .join(format!("{FIXTURE_TEST_NAME}.rs")),
+        project_dir.join("tests").join(format!("{fixture_test_name}.rs")),
         format!(
             "#[test]\nfn {FIXTURE_PASSING_CASE}() {{\n    println!(\"runner smoke test executed\");\n}}\n\n#[test]\nfn {FIXTURE_FAILING_CASE}() {{\n    panic!(\"intentional smoke-test failure\");\n}}\n"
         ),

@@ -38,6 +38,10 @@ fn hash_file<D: Digest>(local_bin_path: &Path) -> anyhow::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
 fn run_hdc_shell_command(args: &[&str]) -> anyhow::Result<Output> {
     Command::new("hdc")
         .arg("shell")
@@ -182,7 +186,9 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os();
     let bin_path = args.nth(1).unwrap();
     // potentially remaining args should be passed through to the test executable.
-    let remaining_args = args;
+    let remaining_args = args
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
 
     let bin_path = Path::new(&bin_path);
     assert!(bin_path.exists(), "Binary not found");
@@ -215,17 +221,31 @@ fn main() -> anyhow::Result<()> {
 
     send_bin_to_device(bin_path, &on_device_bin_path).context("Failed to send binary to device")?;
 
-    let exit_code_file = format!("{}/last_exit_code", TEST_BIN_DIR);
+    let exit_code_file = format!(
+        "{}/last_exit_code-{}",
+        TEST_BIN_DIR,
+        bin_name.to_str().expect("utf-8")
+    );
+    let output = run_hdc_shell_command(&["rm", "-f", &exit_code_file])?;
+    ensure_hdc_shell_success(&output, "Failed to clear device exit code file")?;
+
     // We don't really know how long the test program would run, so we can't set a reasonable
     // timeout. We just fallback to using hdc shell as a command again.
-    let mut hdc_cmd = Command::new("hdc");
-    hdc_cmd
+    let mut command = format!(
+        "cd {} && {}",
+        shell_quote(TEST_BIN_DIR),
+        shell_quote(&on_device_bin_path)
+    );
+    for arg in &remaining_args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    command.push_str("; printf '%s' \"$?\" > ");
+    command.push_str(&shell_quote(&exit_code_file));
+
+    let res = Command::new("hdc")
         .arg("shell")
-        .args(["cd", TEST_BIN_DIR, "&&"].iter())
-        .arg(on_device_bin_path)
-        .args(remaining_args)
-        .args([";", "echo", "$?", ">", &exit_code_file].iter());
-    let res = hdc_cmd
+        .arg(&command)
         .spawn()
         .expect("Failed to run hdc")
         .wait()
