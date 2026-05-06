@@ -66,28 +66,28 @@ jobs:
             -d /tmp/oniro-emulator
           RUN_SH="$(find /tmp/oniro-emulator -name run.sh -print -quit)"
           test -n "$RUN_SH"
-          chmod +x "$RUN_SH"
           EMU_DIR="$(dirname "$RUN_SH")"
-          nohup sudo bash -lc "cd '$EMU_DIR' && ./run.sh" >/tmp/oniro-emulator.log 2>&1 &
+          nohup bash scripts/oniro-emulator-run-ci.sh "$EMU_DIR" 127.0.0.1:55555 \
+            >/tmp/oniro-emulator.log 2>&1 &
       - name: Connect hdc to emulator
         run: |
           port_ready=0
-          for _ in $(seq 1 60); do
-            if bash -lc 'echo >/dev/tcp/127.0.0.1/55555' 2>/dev/null; then
+          for _ in $(seq 1 120); do
+            if nc -z 127.0.0.1 55555; then
               port_ready=1
               break
             fi
-            sleep 5
+            sleep 1
           done
           test "$port_ready" -eq 1
-          hdc tconn 127.0.0.1:55555
           target_ready=0
-          for _ in $(seq 1 60); do
-            if hdc list targets | grep -q "127.0.0.1:55555"; then
+          for _ in $(seq 1 120); do
+            tconn_output="$(hdc tconn 127.0.0.1:55555 2>&1 || true)"
+            if printf '%s\n' "$tconn_output" | grep -q -e "Connect OK" -e "Target is connected"; then
               target_ready=1
               break
             fi
-            sleep 2
+            sleep 1
           done
           test "$target_ready" -eq 1
           hdc list targets
