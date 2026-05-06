@@ -13,15 +13,34 @@
 //! ```
 
 use anyhow::{bail, Context};
+use log::debug;
+use md5::Md5;
 use rexpect::session::PtySession;
 use rexpect::spawn;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use log::debug;
 
 const TEST_BIN_DIR: &str = "/data/local/tmp/ohos-test-runner";
 const HDC_ERROR_NEED_CONNECT_KEY: &str = "[Fail]ExecuteCommand need connect-key?";
+const HASH_TOOL_MISSING: &str = "HASH_TOOL_MISSING";
+
+fn hash_file<D: Digest>(local_bin_path: &Path) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(local_bin_path)?;
+    let mut hasher = D::new();
+    let mut buf = [0_u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .context("Failed to read the binary while hashing on the host")?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
 
 /// Sends the binary at `local_bin_path` to the device using the given hdc session
 fn send_bin_to_device(
@@ -53,7 +72,7 @@ fn send_bin_to_device(
         .expect("Failed to get output of hdc");
     assert!(res.status.success());
     if !res.stdout.starts_with(b"FileTransfer finish") {
-        // Don't bail for now, we still verify the sha256 hash below anyway.
+        // Don't bail for now, we still verify the file hash below anyway.
         log::warn!("Unexpected output from hdc. File transfer may have failed.");
     }
 
@@ -69,29 +88,45 @@ fn send_bin_to_device(
         "Did not expect any other unmatched output from chmod +x"
     );
 
-    let mut file = std::fs::File::open(local_bin_path)?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).context("Failed to hash the binary on the host")?;
-    let hash = hasher.finalize();
-    let hash = hex::encode(hash);
-    debug!("The hash is {hash:?}");
+    let sha256_hash = hash_file::<Sha256>(local_bin_path)?;
+    let md5_hash = hash_file::<Md5>(local_bin_path)?;
+    debug!("The local sha256 hash is {sha256_hash:?}");
+    debug!("The local md5 hash is {md5_hash:?}");
 
-    p.send_line(format!("sha256sum {on_device_bin_path}").as_str())
+    let hash_cmd = format!(
+        "if command -v sha256sum >/dev/null 2>&1; then sha256sum {on_device_bin_path}; \
+         elif command -v md5sum >/dev/null 2>&1; then md5sum {on_device_bin_path}; \
+         else echo {HASH_TOOL_MISSING}; fi"
+    );
+    p.send_line(hash_cmd.as_str())
         .context("hdc shell prompt disconnected?")?;
-    let sha256sum_regex = format!("\n[0-9a-f]{{64}}  {}", on_device_bin_path);
-    let (_, on_device_hash_line) = p
-        .exp_regex(&sha256sum_regex)
-        .context("Couldn't find sha256sum output")?;
+    let hash_output_regex =
+        format!(r"\n(?:[0-9a-f]{{64}}|[0-9a-f]{{32}})  [^\r\n]+|\n{HASH_TOOL_MISSING}");
+    let (_, hash_output_line) = p
+        .exp_regex(&hash_output_regex)
+        .context("Couldn't find device hash output")?;
+    if hash_output_line == format!("\n{HASH_TOOL_MISSING}") {
+        bail!("Neither sha256sum nor md5sum is available on the device");
+    }
+
     // First character is \n
-    let on_device_hash = &on_device_hash_line[1..65];
-    debug!("The hash on the device is {on_device_hash}");
-    if on_device_hash != hash.as_str() {
+    let on_device_hash = hash_output_line[1..]
+        .split_once("  ")
+        .map(|(hash, _path)| hash)
+        .context("Malformed hash output from the device")?;
+    let (expected_hash, hash_kind) = match on_device_hash.len() {
+        64 => (&sha256_hash, "sha256sum"),
+        32 => (&md5_hash, "md5sum"),
+        other => bail!("Unexpected device hash length: {other}"),
+    };
+    debug!("The {hash_kind} hash on the device is {on_device_hash}");
+    if on_device_hash != expected_hash.as_str() {
         bail!(
-            "Hash mismatch. Local sha256sum: {hash}. On device sha256sum output: {on_device_hash}"
+            "Hash mismatch. Local {hash_kind}: {expected_hash}. On device {hash_kind} output: {on_device_hash}"
         );
     }
     p.exp_regex(prompt_regex)
-        .context("Failed to find prompt after sha256sum")?;
+        .context("Failed to find prompt after device hash check")?;
     p.send_line("exit")
         .context("hdc shell prompt disconnected?")?;
     p.exp_eof().context("Should have quit")?;
