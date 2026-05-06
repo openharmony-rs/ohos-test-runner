@@ -15,15 +15,12 @@
 use anyhow::{bail, Context};
 use log::debug;
 use md5::Md5;
-use rexpect::session::PtySession;
-use rexpect::spawn;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 const TEST_BIN_DIR: &str = "/data/local/tmp/ohos-test-runner";
-const HDC_ERROR_NEED_CONNECT_KEY: &str = "[Fail]ExecuteCommand need connect-key?";
 
 fn hash_file<D: Digest>(local_bin_path: &Path) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(local_bin_path)?;
@@ -51,6 +48,21 @@ fn run_hdc_shell_command(args: &[&str]) -> anyhow::Result<Output> {
         .context("Failed to spawn hdc shell")?
         .wait_with_output()
         .context("Failed to wait for hdc shell")
+}
+
+fn ensure_hdc_shell_success(output: &Output, context: &str) -> anyhow::Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!(
+        "{context} failed (status: {}). Stdout: {} Stderr: {}",
+        output.status,
+        stdout.trim(),
+        stderr.trim()
+    );
 }
 
 fn parse_device_hash_output(output: &str) -> anyhow::Result<&str> {
@@ -82,13 +94,13 @@ fn compute_device_hash(
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined_output = format!("{stdout}{stderr}");
 
+    if hash_tool_missing(&combined_output, hash_tool) {
+        return Ok(None);
+    }
+
     if output.status.success() {
         let hash = parse_device_hash_output(&stdout)?;
         return Ok(Some(hash.to_owned()));
-    }
-
-    if hash_tool_missing(&combined_output, hash_tool) {
-        return Ok(None);
     }
 
     bail!(
@@ -98,22 +110,10 @@ fn compute_device_hash(
     );
 }
 
-/// Sends the binary at `local_bin_path` to the device using the given hdc session
-fn send_bin_to_device(
-    mut p: PtySession,
-    local_bin_path: &Path,
-    on_device_bin_path: &str,
-    prompt_regex: &str,
-) -> anyhow::Result<()> {
-    let cmd = format!("mkdir -p {TEST_BIN_DIR}");
-    p.send_line(cmd.as_str())
-        .context("hdc shell prompt disconnected?")?;
-    let (unmatched, _matched) = p
-        .exp_regex(prompt_regex)
-        .context("Couldn't find prompt after trying to create directory")?;
-    if unmatched.trim() != cmd {
-        bail!("Expected to see command `{cmd}` echoed, but received `{unmatched}` instead");
-    }
+/// Sends the binary at `local_bin_path` to the device.
+fn send_bin_to_device(local_bin_path: &Path, on_device_bin_path: &str) -> anyhow::Result<()> {
+    let output = run_hdc_shell_command(&["mkdir", "-p", TEST_BIN_DIR])?;
+    ensure_hdc_shell_success(&output, "Failed to create test directory on device")?;
 
     let mut hdc_cmd = Command::new("hdc");
     hdc_cmd
@@ -132,20 +132,8 @@ fn send_bin_to_device(
         log::warn!("Unexpected output from hdc. File transfer may have failed.");
     }
 
-    let cmd = format!("chmod +x {on_device_bin_path}");
-    p.send_line(cmd.as_str())
-        .context("hdc shell prompt disconnected?")?;
-    let (unmatched, _matched) = p
-        .exp_regex(prompt_regex)
-        .context("Couldn't find prompt after chmod +x")?;
-    debug_assert_eq!(
-        unmatched.trim(),
-        cmd,
-        "Did not expect any other unmatched output from chmod +x"
-    );
-    p.send_line("exit")
-        .context("hdc shell prompt disconnected?")?;
-    p.exp_eof().context("Should have quit")?;
+    let output = run_hdc_shell_command(&["chmod", "+x", on_device_bin_path])?;
+    ensure_hdc_shell_success(&output, "Failed to mark test binary executable on device")?;
 
     let sha256_hash = hash_file::<Sha256>(local_bin_path)?;
     let md5_hash = hash_file::<Md5>(local_bin_path)?;
@@ -169,6 +157,26 @@ fn send_bin_to_device(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{hash_tool_missing, parse_device_hash_output};
+
+    #[test]
+    fn parses_md5_device_hash_output() {
+        let output = "0123456789abcdef0123456789abcdef  /tmp/bin\n";
+        assert_eq!(
+            parse_device_hash_output(output).unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn detects_toybox_missing_hash_tool() {
+        let output = "toybox: Unknown command sha256sum (see \"toybox --help\")\n";
+        assert!(hash_tool_missing(output, "sha256sum"));
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let mut args = std::env::args_os();
@@ -182,12 +190,20 @@ fn main() -> anyhow::Result<()> {
     let on_device_bin_path = format!("{TEST_BIN_DIR}/{}", bin_name.to_str().expect("utf-8"));
     debug!("Bin_path: {:?}", bin_path);
 
-    let mut p = spawn("hdc list targets", Some(5000)).expect("Failed to spawn hdc");
-    let targets = p.exp_eof().expect("Failed to run `hdc list targets`");
-    if targets.contains("[Empty]") {
+    let targets = Command::new("hdc")
+        .args(["list", "targets"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to spawn `hdc list targets`")?
+        .wait_with_output()
+        .context("Failed to wait for `hdc list targets`")?;
+    ensure_hdc_shell_success(&targets, "Failed to list HDC targets")?;
+    let targets_stdout = String::from_utf8_lossy(&targets.stdout);
+    if targets_stdout.contains("[Empty]") {
         bail!("No HDC devices found");
     } else {
-        let lines = targets.trim().lines().collect::<Vec<&str>>();
+        let lines = targets_stdout.trim().lines().collect::<Vec<&str>>();
         if lines.len() != 1 {
             bail!(
                 "Currently only a single hdc device is supported. We found {}:\n{:?}",
@@ -197,25 +213,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut p = spawn("hdc shell", Some(5000)).expect("Failed to spawn hdc shell");
-    let res = p
-        .exp_regex(r"^([$#] |\[FAIL\])")
-        .context("Unexpected output from hdc shell")?;
-    if !res.0.is_empty() {
-        bail!("Encountered unexpected unmatched output from hdc shell initial prompt.")
-    }
-    let prompt_regex = match res.1.as_str() {
-        HDC_ERROR_NEED_CONNECT_KEY => bail!(
-            "HDC server needs a connection key - Currently only a single device can be connected"
-        ),
-        "# " => r"\n# ",
-        "$ " => r"\n\$ ",
-        other => bail!("Unexpected hdc shell prompt: {}", other),
-    };
-
-    debug!("HDC shell prompt regex: `{}`", prompt_regex);
-    send_bin_to_device(p, bin_path, &on_device_bin_path, prompt_regex)
-        .context("Failed to send binary to device")?;
+    send_bin_to_device(bin_path, &on_device_bin_path).context("Failed to send binary to device")?;
 
     let exit_code_file = format!("{}/last_exit_code", TEST_BIN_DIR);
     // We don't really know how long the test program would run, so we can't set a reasonable

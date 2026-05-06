@@ -7,7 +7,6 @@ description = "Support running cargo test / run / bench on OpenHarmony devices."
 repository = "https://github.com/openharmony-rs/ohos-test-runner"
 
 [dependencies]
-rexpect = "0.7.0"
 anyhow = "1.0.97"
 md-5 = "0.11.0"
 sha2 = "0.11.0"
