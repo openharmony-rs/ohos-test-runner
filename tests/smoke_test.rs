@@ -4,67 +4,86 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_OHOS_TARGET: &str = "aarch64-unknown-linux-ohos";
-const FIXTURE_NAME: &str = "smoke-test";
-const FIXTURE_ARG: &str = "integration-smoke";
+const FIXTURE_PACKAGE_NAME: &str = "ohos-test-runner-smoke-fixture";
+const FIXTURE_TEST_NAME: &str = "ohos_test_runner_md5_fallback_smoke_regression";
+const EXPECTED_MD5_LOG: &str = "The md5sum hash on the device is";
 
 #[test]
+#[ignore = "requires an OpenHarmony target toolchain, linker setup, hdc, and a connected device"]
 fn runs_ohos_smoke_binary_via_runner() -> Result<(), Box<dyn std::error::Error>> {
     let target = std::env::var("OHOS_TEST_RUNNER_INTEGRATION_TARGET")
         .unwrap_or_else(|_| DEFAULT_OHOS_TARGET.to_owned());
+    let expected_hash_kind = std::env::var("OHOS_TEST_RUNNER_EXPECT_HASH_KIND").ok();
     let project = TempProject::new()?;
     write_smoke_test_fixture(project.path())?;
 
-    let target_dir = project.path().join("target");
-    let build = Command::new("cargo")
-        .arg("build")
+    let runner_env_var = cargo_target_runner_env_var(&target);
+    let linker_env_var = cargo_target_linker_env_var(&target);
+    let linker = std::env::var(&linker_env_var).map_err(|_| {
+        format!("required linker environment variable `{linker_env_var}` is not set")
+    })?;
+
+    let run = Command::new("cargo")
+        .arg("test")
         .arg("--quiet")
         .arg("--target")
         .arg(&target)
-        .env("CARGO_TARGET_DIR", &target_dir)
+        .arg("--test")
+        .arg(FIXTURE_TEST_NAME)
+        .arg("--")
+        .arg("--nocapture")
+        .env(&runner_env_var, env!("CARGO_BIN_EXE_ohos-test-runner"))
+        .env(&linker_env_var, linker)
+        .env("RUST_LOG", "debug")
         .current_dir(project.path())
         .output()?;
     assert!(
-        build.status.success(),
-        "failed to build smoke-test fixture for target `{target}`\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr)
-    );
-
-    let bin_path = target_dir.join(&target).join("debug").join(FIXTURE_NAME);
-    assert!(
-        bin_path.is_file(),
-        "expected built smoke-test binary at `{}`",
-        bin_path.display()
-    );
-
-    let run = Command::new(env!("CARGO_BIN_EXE_ohos-test-runner"))
-        .arg(&bin_path)
-        .arg(FIXTURE_ARG)
-        .output()?;
-    assert!(
         run.status.success(),
-        "runner failed for `{}`\nstdout:\n{}\nstderr:\n{}",
-        bin_path.display(),
+        "cargo test through ohos-test-runner failed for target `{target}`\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
+    if expected_hash_kind.as_deref() == Some("md5sum") {
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains(EXPECTED_MD5_LOG),
+            "expected md5 fallback log in runner stderr\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
 
     Ok(())
 }
 
 fn write_smoke_test_fixture(project_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    fs::create_dir_all(project_dir.join("src"))?;
+    fs::create_dir_all(project_dir.join("tests"))?;
     fs::write(
         project_dir.join("Cargo.toml"),
-        format!("[package]\nname = \"{FIXTURE_NAME}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
-    )?;
-    fs::write(
-        project_dir.join("src/main.rs"),
         format!(
-            "fn main() {{\n    let arg = std::env::args().nth(1);\n    if arg.as_deref() != Some(\"{FIXTURE_ARG}\") {{\n        eprintln!(\"unexpected arg: {{:?}}\", arg);\n        std::process::exit(17);\n    }}\n}}\n"
+            "[package]\nname = \"{FIXTURE_PACKAGE_NAME}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
         ),
     )?;
+    fs::write(
+        project_dir
+            .join("tests")
+            .join(format!("{FIXTURE_TEST_NAME}.rs")),
+        "#[test]\nfn smoke() {\n    println!(\"runner smoke test executed\");\n}\n",
+    )?;
     Ok(())
+}
+
+fn cargo_target_runner_env_var(target: &str) -> String {
+    format!(
+        "CARGO_TARGET_{}_RUNNER",
+        target.replace('-', "_").to_ascii_uppercase()
+    )
+}
+
+fn cargo_target_linker_env_var(target: &str) -> String {
+    format!(
+        "CARGO_TARGET_{}_LINKER",
+        target.replace('-', "_").to_ascii_uppercase()
+    )
 }
 
 struct TempProject {

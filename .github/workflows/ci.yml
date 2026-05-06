@@ -95,6 +95,7 @@ jobs:
         run: cargo test --test smoke_test -- --ignored
         env:
           OHOS_TEST_RUNNER_INTEGRATION_TARGET: ${{ env.OHOS_TARGET }}
+          OHOS_TEST_RUNNER_EXPECT_HASH_KIND: md5sum
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_OHOS_LINKER: ${{ steps.setup_sdk.outputs.ohos_sdk_native }}/llvm/bin/x86_64-unknown-linux-ohos-clang
       - name: Upload OHOS smoke artifacts
         if: always()
