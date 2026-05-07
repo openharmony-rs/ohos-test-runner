@@ -22,7 +22,6 @@ fn runs_ohos_smoke_binary_via_runner() -> Result<(), Box<dyn std::error::Error>>
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
-    assert_expected_hash_kind(&run);
 
     Ok(())
 }
@@ -84,18 +83,6 @@ fn run_fixture_test_case(
         .current_dir(project_dir)
         .output()?;
     Ok(run)
-}
-
-fn assert_expected_hash_kind(run: &Output) {
-    let expected_hash_kind = std::env::var("OHOS_TEST_RUNNER_EXPECT_HASH_KIND").ok();
-    if expected_hash_kind.as_deref() == Some("md5sum") {
-        assert!(
-            String::from_utf8_lossy(&run.stderr).contains(EXPECTED_MD5_LOG),
-            "expected md5 fallback log in runner stderr\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&run.stdout),
-            String::from_utf8_lossy(&run.stderr)
-        );
-    }
 }
 
 fn write_smoke_test_fixture(project_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {

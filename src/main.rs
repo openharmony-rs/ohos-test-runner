@@ -160,27 +160,6 @@ fn send_bin_to_device(local_bin_path: &Path, on_device_bin_path: &str) -> anyhow
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{hash_tool_missing, parse_device_hash_output};
-
-    #[test]
-    fn parses_md5_device_hash_output() {
-        let output = "0123456789abcdef0123456789abcdef  /tmp/bin\n";
-        assert_eq!(
-            parse_device_hash_output(output).unwrap(),
-            "0123456789abcdef0123456789abcdef"
-        );
-    }
-
-    #[test]
-    fn detects_toybox_missing_hash_tool() {
-        let output = "toybox: Unknown command sha256sum (see \"toybox --help\")\n";
-        assert!(hash_tool_missing(output, "sha256sum"));
-    }
-}
-
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let mut args = std::env::args_os();
@@ -273,4 +252,24 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hash_tool_missing, parse_device_hash_output};
+
+    #[test]
+    fn parses_md5_device_hash_output() {
+        let output = "0123456789abcdef0123456789abcdef  /tmp/bin\n";
+        assert_eq!(
+            parse_device_hash_output(output).unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn detects_toybox_missing_hash_tool() {
+        let output = "toybox: Unknown command sha256sum (see \"toybox --help\")\n";
+        assert!(hash_tool_missing(output, "sha256sum"));
+    }
 }
