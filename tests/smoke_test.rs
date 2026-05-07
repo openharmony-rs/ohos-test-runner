@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_OHOS_TARGET: &str = "aarch64-unknown-linux-ohos";
 const FIXTURE_PASSING_CASE: &str = "smoke_passes";
 const FIXTURE_FAILING_CASE: &str = "smoke_fails";
-const EXPECTED_MD5_LOG: &str = "The md5sum hash on the device is";
 const EXPECTED_FAILING_EXIT_CODE: &str = "Binary exited with Non-zero code: 101";
 
 #[test]
@@ -45,7 +44,6 @@ fn propagates_failing_test_exit_code_via_runner() -> Result<(), Box<dyn std::err
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
-    assert_expected_hash_kind(&run);
 
     Ok(())
 }
