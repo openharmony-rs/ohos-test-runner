@@ -1,0 +1,3 @@
+[submodule "emulator-action"]
+	path = emulator-action
+	url = https://github.com/openharmony-rs/emulator-action.git

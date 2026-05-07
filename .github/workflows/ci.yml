@@ -22,8 +22,6 @@ jobs:
     name: Oniro Emulator Test
     runs-on: ubuntu-latest
     env:
-      ONIRO_EMULATOR_RELEASE: v6.1
-      ONIRO_EMULATOR_ASSET: oniro_emulator.zip
       OHOS_TARGET: x86_64-unknown-linux-ohos
     steps:
       - uses: actions/checkout@v4
@@ -35,62 +33,13 @@ jobs:
         uses: openharmony-rs/setup-ohos-sdk@v1.0.0
         with:
           version: 6.1
-      - name: Install host dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 unzip
       - name: Add OHOS toolchains to PATH
         run: |
           echo "$(dirname "${OHOS_SDK_NATIVE}")/toolchains" >> "$GITHUB_PATH"
         env:
           OHOS_SDK_NATIVE: ${{ steps.setup_sdk.outputs.ohos_sdk_native }}
-      - name: Cache Oniro emulator archive
-        id: cache_oniro_emulator
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/oniro-emulator/${{ env.ONIRO_EMULATOR_RELEASE }}
-          key: ${{ runner.os }}-oniro-emulator-${{ env.ONIRO_EMULATOR_RELEASE }}
-      - name: Download Oniro emulator archive
-        if: steps.cache_oniro_emulator.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p "$HOME/.cache/oniro-emulator/${ONIRO_EMULATOR_RELEASE}"
-          curl -fL \
-            "https://github.com/eclipse-oniro4openharmony/device_board_oniro/releases/download/${ONIRO_EMULATOR_RELEASE}/${ONIRO_EMULATOR_ASSET}" \
-            -o "$HOME/.cache/oniro-emulator/${ONIRO_EMULATOR_RELEASE}/${ONIRO_EMULATOR_ASSET}"
-      - name: Download and start Oniro emulator
-        run: |
-          rm -rf /tmp/oniro-emulator
-          mkdir -p /tmp/oniro-emulator
-          unzip -q \
-            "$HOME/.cache/oniro-emulator/${ONIRO_EMULATOR_RELEASE}/${ONIRO_EMULATOR_ASSET}" \
-            -d /tmp/oniro-emulator
-          RUN_SH="$(find /tmp/oniro-emulator -name run.sh -print -quit)"
-          test -n "$RUN_SH"
-          EMU_DIR="$(dirname "$RUN_SH")"
-          nohup bash scripts/oniro-emulator-run-ci.sh "$EMU_DIR" 127.0.0.1:55555 \
-            >/tmp/oniro-emulator.log 2>&1 &
-      - name: Connect hdc to emulator
-        run: |
-          port_ready=0
-          for _ in $(seq 1 120); do
-            if nc -z 127.0.0.1 55555; then
-              port_ready=1
-              break
-            fi
-            sleep 1
-          done
-          test "$port_ready" -eq 1
-          target_ready=0
-          for _ in $(seq 1 120); do
-            tconn_output="$(hdc tconn 127.0.0.1:55555 2>&1 || true)"
-            if printf '%s\n' "$tconn_output" | grep -q -e "Connect OK" -e "Target is connected"; then
-              target_ready=1
-              break
-            fi
-            sleep 1
-          done
-          test "$target_ready" -eq 1
-          hdc list targets
+      - name: Start Oniro emulator
+        uses: openharmony-rs/emulator-action@v0.1
       - name: Run OHOS smoke test
         run: cargo test --test smoke_test -- --ignored
         env:
