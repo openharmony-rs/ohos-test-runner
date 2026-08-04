@@ -223,21 +223,73 @@ fn check_device_selection(
     }
 }
 
+fn print_help() {
+    println!(
+        "\
+{name} {version}
+{description}
+
+Usage:
+    {name} <BINARY> [ARGS]...
+    {name} --version | --help
+
+Cargo invokes the runner with the cross-compiled binary as the first argument, and forwards
+[ARGS] to the binary running on the device.
+
+Options:
+    -h, --help       Print this help
+    -V, --version    Print version information
+
+Environment variables:
+    {HDC_TARGET_ENV_VAR}
+        The hdc connect-key (`hdc -t`) of the device to run the binary on. Required if
+        multiple devices are attached, optional otherwise. Use `hdc list targets` to list
+        the connect-keys of the attached devices.
+    RUST_LOG
+        Log level of the runner itself, e.g. `debug`.
+
+Example:
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_RUNNER={name}
+    cargo test --target aarch64-unknown-linux-ohos",
+        name = env!("CARGO_PKG_NAME"),
+        version = env!("CARGO_PKG_VERSION"),
+        description = env!("CARGO_PKG_DESCRIPTION"),
+    );
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let hdc = Hdc::from_env();
     if let Some(target) = &hdc.target {
         debug!("Using the hdc device `{target}` selected via {HDC_TARGET_ENV_VAR}");
     }
-    let mut args = std::env::args_os();
-    let bin_path = args.nth(1).unwrap();
+    let mut args = std::env::args_os().skip(1);
+    let Some(bin_path) = args.next() else {
+        print_help();
+        bail!("Missing the path to the binary to run on the device");
+    };
+    // Cargo always passes the binary as the first argument, so flags can only be intended
+    // for the runner itself if they appear in this position.
+    match bin_path.to_str() {
+        Some("--version" | "-V") => {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("--help" | "-h") => {
+            print_help();
+            return Ok(());
+        }
+        _ => {}
+    }
     // potentially remaining args should be passed through to the test executable.
     let remaining_args = args
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
 
     let bin_path = Path::new(&bin_path);
-    assert!(bin_path.exists(), "Binary not found");
+    if !bin_path.exists() {
+        bail!("Binary not found: {}", bin_path.display());
+    }
     let bin_name = bin_path.file_name().expect("Test bin must have a filename");
     let on_device_bin_path = format!("{TEST_BIN_DIR}/{}", bin_name.to_str().expect("utf-8"));
     debug!("Bin_path: {:?}", bin_path);
