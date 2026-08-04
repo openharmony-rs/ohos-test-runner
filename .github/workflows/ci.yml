@@ -27,6 +27,25 @@ jobs:
       # The tests requiring a device are marked as ignored and run in the `smoke-test` job.
       - run: cargo test
 
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Ensure a toolchain for `cargo metadata` below, instead of relying on the
+      # runner image having one preinstalled.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Read the MSRV from Cargo.toml
+        id: msrv
+        run: |
+          echo "toolchain=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "ohos-test-runner").rust_version')" >> "$GITHUB_OUTPUT"
+      # Installs the MSRV toolchain and makes it the default for the check below.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.toolchain }}
+      # `--locked` since a dependency update may raise the effective MSRV.
+      - run: cargo check --locked --all-targets
+
   smoke-test:
     name: Oniro Emulator Test
     runs-on: ubuntu-latest
