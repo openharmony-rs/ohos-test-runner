@@ -37,6 +37,10 @@ cargo test --target aarch64-unknown-linux-ohos
 
 With a single attached device the variable is optional and can be left unset.
 
+Environment variables starting with `OHOS_TEST_RUNNER` which are not known to the installed version
+are reported with a warning, since they are likely typos, or configuration for a newer version of
+this tool. Run `ohos-test-runner --help` for the list of supported variables.
+
 ### License 
 
 Licensed under the Apache-2.0 license.

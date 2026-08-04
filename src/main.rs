@@ -27,6 +27,20 @@ const TEST_BIN_DIR: &str = "/data/local/tmp/ohos-test-runner";
 /// Environment variable to select the device (hdc connect-key) to run the binary on.
 const HDC_TARGET_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_TARGET";
 
+const ENV_VAR_PREFIX: &str = "OHOS_TEST_RUNNER";
+
+/// The user-facing environment variables of this tool. Variables with the [`ENV_VAR_PREFIX`]
+/// which are neither listed here nor in [`INTERNAL_ENV_VARS`] are reported to the user
+/// as unknown.
+const KNOWN_ENV_VARS: &[&str] = &[HDC_TARGET_ENV_VAR];
+
+/// Internal environment variables, which are recognized to avoid spurious warnings,
+/// but not advertised to users.
+const INTERNAL_ENV_VARS: &[&str] = &[
+    // Only used by the integration tests of this crate, but inherited by the runner.
+    "OHOS_TEST_RUNNER_INTEGRATION_TARGET",
+];
+
 /// The hdc invocation, including the device selection (`-t`) if configured.
 struct Hdc {
     target: Option<String>,
@@ -223,6 +237,35 @@ fn check_device_selection(
     }
 }
 
+fn unknown_env_vars<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
+    let mut unknown = names
+        .into_iter()
+        .filter(|name| {
+            name.starts_with(ENV_VAR_PREFIX)
+                && !KNOWN_ENV_VARS.contains(&name.as_str())
+                && !INTERNAL_ENV_VARS.contains(&name.as_str())
+        })
+        .collect::<Vec<String>>();
+    unknown.sort();
+    unknown
+}
+
+/// Warns about environment variables which look like they are meant for this tool, but are
+/// not known to this version. Those are either typos, or configuration for a newer version.
+fn warn_about_unknown_env_vars() {
+    let names = std::env::vars_os().filter_map(|(name, _)| name.into_string().ok());
+    for name in unknown_env_vars(names) {
+        eprintln!(
+            "warning: The environment variable `{name}` is not known to {} {}. Please check the \
+             spelling, or update to a newer version if the variable was added in a later release. \
+             Known variables: {}",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            KNOWN_ENV_VARS.join(", ")
+        );
+    }
+}
+
 fn print_help() {
     println!(
         "\
@@ -248,6 +291,9 @@ Environment variables:
     RUST_LOG
         Log level of the runner itself, e.g. `debug`.
 
+Environment variables starting with `{ENV_VAR_PREFIX}` which are not listed above are reported
+as unknown, since they are likely typos or configuration for a newer version of this tool.
+
 Example:
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_RUNNER={name}
     cargo test --target aarch64-unknown-linux-ohos",
@@ -259,6 +305,7 @@ Example:
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
+    warn_about_unknown_env_vars();
     let hdc = Hdc::from_env();
     if let Some(target) = &hdc.target {
         debug!("Using the hdc device `{target}` selected via {HDC_TARGET_ENV_VAR}");
@@ -366,7 +413,29 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_device_selection, hash_tool_missing, parse_device_hash_output};
+    use super::{
+        check_device_selection, hash_tool_missing, parse_device_hash_output, unknown_env_vars,
+    };
+
+    #[test]
+    fn detects_unknown_env_vars() {
+        let names = [
+            "PATH",
+            "OHOS_TEST_RUNNER_HDC_TARGET",
+            "OHOS_TEST_RUNNER_HDC_TARGETT",
+            "OHOS_TEST_RUNNER_FUTURE_OPTION",
+            "OHOS_TEST_RUNNER_INTEGRATION_TARGET",
+            "OHOS_SDK_NATIVE",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            unknown_env_vars(names),
+            [
+                "OHOS_TEST_RUNNER_FUTURE_OPTION",
+                "OHOS_TEST_RUNNER_HDC_TARGETT"
+            ]
+        );
+    }
 
     #[test]
     fn accepts_single_device_without_selection() {
