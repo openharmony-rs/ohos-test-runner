@@ -5,9 +5,11 @@
 //! After installing ohos-test-runner, configure your project to use the custom
 //! target runner, for the relevant target triple, e.g.
 //!
-//! ```
+//! ```sh
 //! # Setup ohos-test-runner as the target runner for aarch64 OpenHarmony.
 //! export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_RUNNER=ohos-test-runner
+//! # Optional: Select the device, if multiple devices are attached.
+//! export OHOS_TEST_RUNNER_HDC_TARGET=<connect-key>
 //! # Run cargo test (more environment variables might be needed, depending on your project)
 //! cargo test --target aarch64-unknown-linux-ohos
 //! ```
@@ -21,6 +23,44 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 const TEST_BIN_DIR: &str = "/data/local/tmp/ohos-test-runner";
+
+/// Environment variable to select the device (hdc connect-key) to run the binary on.
+const HDC_TARGET_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_TARGET";
+
+/// The hdc invocation, including the device selection (`-t`) if configured.
+struct Hdc {
+    target: Option<String>,
+}
+
+impl Hdc {
+    fn from_env() -> Self {
+        let target = std::env::var(HDC_TARGET_ENV_VAR)
+            .ok()
+            .map(|target| target.trim().to_owned())
+            .filter(|target| !target.is_empty());
+        Self { target }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new("hdc");
+        if let Some(target) = &self.target {
+            command.args(["-t", target]);
+        }
+        command
+    }
+
+    fn shell(&self, args: &[&str]) -> anyhow::Result<Output> {
+        self.command()
+            .arg("shell")
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn hdc shell")?
+            .wait_with_output()
+            .context("Failed to wait for hdc shell")
+    }
+}
 
 fn hash_file<D: Digest>(local_bin_path: &Path) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(local_bin_path)?;
@@ -40,18 +80,6 @@ fn hash_file<D: Digest>(local_bin_path: &Path) -> anyhow::Result<String> {
 
 fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
-}
-
-fn run_hdc_shell_command(args: &[&str]) -> anyhow::Result<Output> {
-    Command::new("hdc")
-        .arg("shell")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn hdc shell")?
-        .wait_with_output()
-        .context("Failed to wait for hdc shell")
 }
 
 fn ensure_hdc_shell_success(output: &Output, context: &str) -> anyhow::Result<()> {
@@ -90,10 +118,11 @@ fn hash_tool_missing(output: &str, hash_tool: &str) -> bool {
 }
 
 fn compute_device_hash(
+    hdc: &Hdc,
     hash_tool: &str,
     on_device_bin_path: &str,
 ) -> anyhow::Result<Option<String>> {
-    let output = run_hdc_shell_command(&[hash_tool, on_device_bin_path])?;
+    let output = hdc.shell(&[hash_tool, on_device_bin_path])?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined_output = format!("{stdout}{stderr}");
@@ -115,11 +144,15 @@ fn compute_device_hash(
 }
 
 /// Sends the binary at `local_bin_path` to the device.
-fn send_bin_to_device(local_bin_path: &Path, on_device_bin_path: &str) -> anyhow::Result<()> {
-    let output = run_hdc_shell_command(&["mkdir", "-p", TEST_BIN_DIR])?;
+fn send_bin_to_device(
+    hdc: &Hdc,
+    local_bin_path: &Path,
+    on_device_bin_path: &str,
+) -> anyhow::Result<()> {
+    let output = hdc.shell(&["mkdir", "-p", TEST_BIN_DIR])?;
     ensure_hdc_shell_success(&output, "Failed to create test directory on device")?;
 
-    let mut hdc_cmd = Command::new("hdc");
+    let mut hdc_cmd = hdc.command();
     hdc_cmd
         .args(["file", "send"])
         .arg(local_bin_path)
@@ -136,7 +169,7 @@ fn send_bin_to_device(local_bin_path: &Path, on_device_bin_path: &str) -> anyhow
         log::warn!("Unexpected output from hdc. File transfer may have failed.");
     }
 
-    let output = run_hdc_shell_command(&["chmod", "+x", on_device_bin_path])?;
+    let output = hdc.shell(&["chmod", "+x", on_device_bin_path])?;
     ensure_hdc_shell_success(&output, "Failed to mark test binary executable on device")?;
 
     let sha256_hash = hash_file::<Sha256>(local_bin_path)?;
@@ -144,9 +177,10 @@ fn send_bin_to_device(local_bin_path: &Path, on_device_bin_path: &str) -> anyhow
     debug!("The local sha256 hash is {sha256_hash:?}");
     debug!("The local md5 hash is {md5_hash:?}");
 
-    let device_hash = if let Some(hash) = compute_device_hash("sha256sum", on_device_bin_path)? {
+    let device_hash = if let Some(hash) = compute_device_hash(hdc, "sha256sum", on_device_bin_path)?
+    {
         ("sha256sum", sha256_hash, hash)
-    } else if let Some(hash) = compute_device_hash("md5sum", on_device_bin_path)? {
+    } else if let Some(hash) = compute_device_hash(hdc, "md5sum", on_device_bin_path)? {
         ("md5sum", md5_hash, hash)
     } else {
         bail!("Neither sha256sum nor md5sum is available on the device");
@@ -160,8 +194,41 @@ fn send_bin_to_device(local_bin_path: &Path, on_device_bin_path: &str) -> anyhow
     }
     Ok(())
 }
+
+/// Checks that the requested device - or the only connected device, if none was requested -
+/// is available.
+fn check_device_selection(
+    targets_stdout: &str,
+    requested_target: Option<&str>,
+) -> anyhow::Result<()> {
+    let targets = targets_stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<&str>>();
+    if targets.is_empty() || targets.contains(&"[Empty]") {
+        bail!("No HDC devices found");
+    }
+    match requested_target {
+        Some(target) if !targets.contains(&target) => bail!(
+            "The device `{target}` selected via {HDC_TARGET_ENV_VAR} is not connected. \
+             Connected devices: {targets:?}"
+        ),
+        None if targets.len() != 1 => bail!(
+            "Found {} hdc devices: {targets:?}\nSet {HDC_TARGET_ENV_VAR} to the connect-key of \
+             the device to use.",
+            targets.len()
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
+    let hdc = Hdc::from_env();
+    if let Some(target) = &hdc.target {
+        debug!("Using the hdc device `{target}` selected via {HDC_TARGET_ENV_VAR}");
+    }
     let mut args = std::env::args_os();
     let bin_path = args.nth(1).unwrap();
     // potentially remaining args should be passed through to the test executable.
@@ -185,27 +252,17 @@ fn main() -> anyhow::Result<()> {
         .context("Failed to wait for `hdc list targets`")?;
     ensure_hdc_shell_success(&targets, "Failed to list HDC targets")?;
     let targets_stdout = String::from_utf8_lossy(&targets.stdout);
-    if targets_stdout.contains("[Empty]") {
-        bail!("No HDC devices found");
-    } else {
-        let lines = targets_stdout.trim().lines().collect::<Vec<&str>>();
-        if lines.len() != 1 {
-            bail!(
-                "Currently only a single hdc device is supported. We found {}:\n{:?}",
-                lines.len(),
-                lines
-            );
-        }
-    }
+    check_device_selection(&targets_stdout, hdc.target.as_deref())?;
 
-    send_bin_to_device(bin_path, &on_device_bin_path).context("Failed to send binary to device")?;
+    send_bin_to_device(&hdc, bin_path, &on_device_bin_path)
+        .context("Failed to send binary to device")?;
 
     let exit_code_file = format!(
         "{}/last_exit_code-{}",
         TEST_BIN_DIR,
         bin_name.to_str().expect("utf-8")
     );
-    let output = run_hdc_shell_command(&["rm", "-f", &exit_code_file])?;
+    let output = hdc.shell(&["rm", "-f", &exit_code_file])?;
     ensure_hdc_shell_success(&output, "Failed to clear device exit code file")?;
 
     // We don't really know how long the test program would run, so we can't set a reasonable
@@ -222,7 +279,8 @@ fn main() -> anyhow::Result<()> {
     command.push_str("; printf '%s' \"$?\" > ");
     command.push_str(&shell_quote(&exit_code_file));
 
-    let res = Command::new("hdc")
+    let res = hdc
+        .command()
         .arg("shell")
         .arg(&command)
         .spawn()
@@ -233,7 +291,7 @@ fn main() -> anyhow::Result<()> {
         bail!("Non zero exit code from hdc: {res}");
     }
 
-    let mut hdc_cmd = Command::new("hdc");
+    let mut hdc_cmd = hdc.command();
     let res = hdc_cmd
         .arg("shell")
         .arg("cat")
@@ -256,7 +314,42 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hash_tool_missing, parse_device_hash_output};
+    use super::{check_device_selection, hash_tool_missing, parse_device_hash_output};
+
+    #[test]
+    fn accepts_single_device_without_selection() {
+        assert!(check_device_selection("7001005458323933328a01e9a4bb3900\n", None).is_ok());
+    }
+
+    #[test]
+    fn rejects_multiple_devices_without_selection() {
+        let targets = "127.0.0.1:5555\n7001005458323933328a01e9a4bb3900\n";
+        let err = check_device_selection(targets, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("OHOS_TEST_RUNNER_HDC_TARGET"), "{err}");
+    }
+
+    #[test]
+    fn accepts_selected_device_among_multiple() {
+        let targets = "127.0.0.1:5555\n7001005458323933328a01e9a4bb3900\n";
+        assert!(check_device_selection(targets, Some("127.0.0.1:5555")).is_ok());
+    }
+
+    #[test]
+    fn rejects_selected_device_that_is_not_connected() {
+        let targets = "127.0.0.1:5555\n";
+        let err = check_device_selection(targets, Some("127.0.0.1:5556"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("127.0.0.1:5556"), "{err}");
+    }
+
+    #[test]
+    fn rejects_empty_target_list() {
+        assert!(check_device_selection("[Empty]\n", Some("127.0.0.1:5555")).is_err());
+        assert!(check_device_selection("", None).is_err());
+    }
 
     #[test]
     fn parses_md5_device_hash_output() {
