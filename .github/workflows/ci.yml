@@ -16,7 +16,16 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Unit and CLI Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The tests requiring a device are marked as ignored and run in the `smoke-test` job.
+      - run: cargo test
 
   smoke-test:
     name: Oniro Emulator Test
