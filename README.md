@@ -20,6 +20,23 @@ cargo test --target aarch64-unknown-linux-ohos
 The example assumes that you already have a working build environment to cross-compile your project
 for OpenHarmony.
 
+### Selecting a device
+
+If more than one device is attached, the device must be selected via the
+`OHOS_TEST_RUNNER_HDC_TARGET` environment variable, which is passed to `hdc` as the `-t` argument.
+Since cargo invokes the runner with the test binary and its arguments only, the device can't be
+selected via a command line argument.
+
+```
+# List the connect-keys of the attached devices
+hdc list targets
+# Run the tests on a specific device
+export OHOS_TEST_RUNNER_HDC_TARGET=<connect-key>
+cargo test --target aarch64-unknown-linux-ohos
+```
+
+With a single attached device the variable is optional and can be left unset.
+
 ### License 
 
 Licensed under the Apache-2.0 license.
