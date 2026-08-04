@@ -11,7 +11,7 @@ jobs:
     name: Code Quality
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -22,7 +22,7 @@ jobs:
     name: Unit and CLI Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # The tests requiring a device are marked as ignored and run in the `smoke-test` job.
       - run: cargo test
@@ -33,13 +33,13 @@ jobs:
     env:
       OHOS_TARGET: x86_64-unknown-linux-ohos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-ohos
       - name: Setup OpenHarmony SDK
         id: setup_sdk
-        uses: openharmony-rs/setup-ohos-sdk@v1.0.0
+        uses: openharmony-rs/setup-ohos-sdk@v1
         with:
           version: 6.1
       - name: Add OHOS toolchains to PATH
@@ -48,7 +48,7 @@ jobs:
         env:
           OHOS_SDK_NATIVE: ${{ steps.setup_sdk.outputs.ohos_sdk_native }}
       - name: Start Oniro emulator
-        uses: openharmony-rs/emulator-action@v0.1
+        uses: openharmony-rs/emulator-action@v1
       - name: Run OHOS smoke test
         run: cargo test --test smoke_test -- --ignored
         env:
@@ -56,7 +56,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_OHOS_LINKER: ${{ steps.setup_sdk.outputs.ohos_sdk_native }}/llvm/bin/x86_64-unknown-linux-ohos-clang
       - name: Upload OHOS smoke artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ohos-smoke-artifacts
           path: /tmp/oniro-emulator.log
