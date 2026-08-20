@@ -21,8 +21,14 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const TEST_BIN_DIR: &str = "/data/local/tmp/ohos-test-runner";
+
+/// Nextest's per-attempt identifier. Unique for each process-per-test invocation,
+/// including retries. Not set when the runner is invoked by `cargo test`.
+const NEXTEST_ATTEMPT_ID_ENV_VAR: &str = "NEXTEST_ATTEMPT_ID";
 
 /// Environment variable to select the device (hdc connect-key) to run the binary on.
 const HDC_TARGET_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_TARGET";
@@ -74,6 +80,106 @@ impl Hdc {
             .wait_with_output()
             .context("Failed to wait for hdc shell")
     }
+}
+
+/// Remote directory, binary, and exit-code file for a single runner invocation.
+///
+/// Concurrent nextest invocations of the same host binary previously shared
+/// `{TEST_BIN_DIR}/{bin_name}` and `{TEST_BIN_DIR}/last_exit_code-{bin_name}`,
+/// so they could overwrite each other. Each invocation now gets its own
+/// subdirectory under [`TEST_BIN_DIR`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteInvocation {
+    dir: String,
+    bin_path: String,
+    exit_code_file: String,
+}
+
+impl RemoteInvocation {
+    fn new(bin_name: &str, invocation_id: &str) -> Self {
+        let id = sanitize_path_component(invocation_id);
+        let dir = format!("{TEST_BIN_DIR}/{id}");
+        Self {
+            bin_path: format!("{dir}/{bin_name}"),
+            exit_code_file: format!("{dir}/exit_code"),
+            dir,
+        }
+    }
+}
+
+/// Best-effort removal of an invocation directory on the device.
+struct RemoteCleanup<'a> {
+    hdc: &'a Hdc,
+    dir: String,
+}
+
+impl Drop for RemoteCleanup<'_> {
+    fn drop(&mut self) {
+        if let Err(err) = self.hdc.shell(&["rm", "-rf", &self.dir]) {
+            log::warn!(
+                "Failed to clean up remote invocation directory {}: {err}",
+                self.dir
+            );
+        }
+    }
+}
+
+fn sanitize_path_component(s: &str) -> String {
+    let sanitized: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        "inv".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn short_hex_hash(s: &str) -> String {
+    let digest = Sha256::digest(s.as_bytes());
+    hex::encode(&digest[..8])
+}
+
+/// Filesystem-safe identifier unique to this runner invocation.
+///
+/// Prefer nextest's per-attempt ID when present (hashed so `$`, `:`, and long
+/// test names stay within `NAME_MAX`). Otherwise use the process id plus a
+/// unique suffix so parallel `cargo test` invocations still get distinct paths.
+fn invocation_id(nextest_attempt_id: Option<&str>, pid: u32, unique_suffix: &str) -> String {
+    if let Some(attempt_id) = nextest_attempt_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        format!("nx-{}", short_hex_hash(attempt_id))
+    } else {
+        format!("p{pid}-{}", sanitize_path_component(unique_suffix))
+    }
+}
+
+fn generate_unique_suffix() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos}-{seq}")
+}
+
+fn current_invocation_id() -> String {
+    let nextest_attempt_id = std::env::var(NEXTEST_ATTEMPT_ID_ENV_VAR).ok();
+    invocation_id(
+        nextest_attempt_id.as_deref(),
+        std::process::id(),
+        &generate_unique_suffix(),
+    )
 }
 
 fn hash_file<D: Digest>(local_bin_path: &Path) -> anyhow::Result<String> {
@@ -161,16 +267,17 @@ fn compute_device_hash(
 fn send_bin_to_device(
     hdc: &Hdc,
     local_bin_path: &Path,
+    remote_dir: &str,
     on_device_bin_path: &str,
 ) -> anyhow::Result<()> {
-    let output = hdc.shell(&["mkdir", "-p", TEST_BIN_DIR])?;
+    let output = hdc.shell(&["mkdir", "-p", remote_dir])?;
     ensure_hdc_shell_success(&output, "Failed to create test directory on device")?;
 
     let mut hdc_cmd = hdc.command();
     hdc_cmd
         .args(["file", "send"])
         .arg(local_bin_path)
-        .arg(TEST_BIN_DIR);
+        .arg(remote_dir);
     let res = hdc_cmd
         .stdout(Stdio::piped())
         .spawn()
@@ -337,9 +444,17 @@ fn main() -> anyhow::Result<()> {
     if !bin_path.exists() {
         bail!("Binary not found: {}", bin_path.display());
     }
-    let bin_name = bin_path.file_name().expect("Test bin must have a filename");
-    let on_device_bin_path = format!("{TEST_BIN_DIR}/{}", bin_name.to_str().expect("utf-8"));
+    let bin_name = bin_path
+        .file_name()
+        .expect("Test bin must have a filename")
+        .to_str()
+        .expect("utf-8");
+    let remote = RemoteInvocation::new(bin_name, &current_invocation_id());
     debug!("Bin_path: {:?}", bin_path);
+    debug!(
+        "Remote invocation dir: {}, binary: {}, exit code file: {}",
+        remote.dir, remote.bin_path, remote.exit_code_file
+    );
 
     let targets = Command::new("hdc")
         .args(["list", "targets"])
@@ -353,30 +468,30 @@ fn main() -> anyhow::Result<()> {
     let targets_stdout = String::from_utf8_lossy(&targets.stdout);
     check_device_selection(&targets_stdout, hdc.target.as_deref())?;
 
-    send_bin_to_device(&hdc, bin_path, &on_device_bin_path)
+    let _cleanup = RemoteCleanup {
+        hdc: &hdc,
+        dir: remote.dir.clone(),
+    };
+
+    send_bin_to_device(&hdc, bin_path, &remote.dir, &remote.bin_path)
         .context("Failed to send binary to device")?;
 
-    let exit_code_file = format!(
-        "{}/last_exit_code-{}",
-        TEST_BIN_DIR,
-        bin_name.to_str().expect("utf-8")
-    );
-    let output = hdc.shell(&["rm", "-f", &exit_code_file])?;
+    let output = hdc.shell(&["rm", "-f", &remote.exit_code_file])?;
     ensure_hdc_shell_success(&output, "Failed to clear device exit code file")?;
 
     // We don't really know how long the test program would run, so we can't set a reasonable
     // timeout. We just fallback to using hdc shell as a command again.
     let mut command = format!(
         "cd {} && {}",
-        shell_quote(TEST_BIN_DIR),
-        shell_quote(&on_device_bin_path)
+        shell_quote(&remote.dir),
+        shell_quote(&remote.bin_path)
     );
     for arg in &remaining_args {
         command.push(' ');
         command.push_str(&shell_quote(arg));
     }
     command.push_str("; printf '%s' \"$?\" > ");
-    command.push_str(&shell_quote(&exit_code_file));
+    command.push_str(&shell_quote(&remote.exit_code_file));
 
     let res = hdc
         .command()
@@ -394,7 +509,7 @@ fn main() -> anyhow::Result<()> {
     let res = hdc_cmd
         .arg("shell")
         .arg("cat")
-        .arg(exit_code_file)
+        .arg(&remote.exit_code_file)
         .stdout(Stdio::piped())
         .spawn()
         .context("Failed to spawn hdc shell")?
@@ -414,8 +529,11 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_device_selection, hash_tool_missing, parse_device_hash_output, unknown_env_vars,
+        check_device_selection, generate_unique_suffix, hash_tool_missing, invocation_id,
+        parse_device_hash_output, sanitize_path_component, unknown_env_vars, RemoteInvocation,
+        TEST_BIN_DIR,
     };
+    use std::collections::HashSet;
 
     #[test]
     fn detects_unknown_env_vars() {
@@ -485,5 +603,121 @@ mod tests {
     fn detects_toybox_missing_hash_tool() {
         let output = "toybox: Unknown command sha256sum (see \"toybox --help\")\n";
         assert!(hash_tool_missing(output, "sha256sum"));
+    }
+
+    fn assert_disjoint_remote_invocations(a: &RemoteInvocation, b: &RemoteInvocation) {
+        assert_ne!(a.dir, b.dir);
+        assert_ne!(a.bin_path, b.bin_path);
+        assert_ne!(a.exit_code_file, b.exit_code_file);
+
+        let a_prefix = format!("{}/", a.dir);
+        let b_prefix = format!("{}/", b.dir);
+        assert!(
+            a.bin_path.starts_with(&a_prefix) && a.exit_code_file.starts_with(&a_prefix),
+            "{a:?}"
+        );
+        assert!(
+            b.bin_path.starts_with(&b_prefix) && b.exit_code_file.starts_with(&b_prefix),
+            "{b:?}"
+        );
+        assert!(
+            !a.bin_path.starts_with(&b_prefix) && !a.exit_code_file.starts_with(&b_prefix),
+            "first invocation reused second dir: {a:?} {b:?}"
+        );
+        assert!(
+            !b.bin_path.starts_with(&a_prefix) && !b.exit_code_file.starts_with(&a_prefix),
+            "second invocation reused first dir: {a:?} {b:?}"
+        );
+
+        for path in [
+            &a.dir,
+            &a.bin_path,
+            &a.exit_code_file,
+            &b.dir,
+            &b.bin_path,
+            &b.exit_code_file,
+        ] {
+            assert!(
+                path.starts_with(&format!("{TEST_BIN_DIR}/")),
+                "path {path} is not under {TEST_BIN_DIR}"
+            );
+            assert!(
+                !path.split('/').any(|component| component == ".."),
+                "path {path} contains a parent-directory component"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_unique_suffixes_are_distinct() {
+        let suffixes: Vec<String> = (0..64).map(|_| generate_unique_suffix()).collect();
+        let unique: HashSet<&String> = suffixes.iter().collect();
+        assert_eq!(unique.len(), suffixes.len());
+    }
+
+    #[test]
+    fn fallback_invocation_ids_differ_by_pid_or_suffix() {
+        assert_ne!(
+            invocation_id(None, 11, "aaa"),
+            invocation_id(None, 12, "aaa")
+        );
+        assert_ne!(
+            invocation_id(None, 11, "aaa"),
+            invocation_id(None, 11, "bbb")
+        );
+    }
+
+    #[test]
+    fn nextest_attempt_ids_produce_distinct_invocation_ids() {
+        let attempt_a = "55459fda-13fe-406a-b4e3-0230fd52bb03:pkg::bin$mod::test_a";
+        let attempt_b = "55459fda-13fe-406a-b4e3-0230fd52bb03:pkg::bin$mod::test_b";
+        assert_ne!(
+            invocation_id(Some(attempt_a), 1, "same"),
+            invocation_id(Some(attempt_b), 1, "same")
+        );
+    }
+
+    #[test]
+    fn invocation_id_is_path_safe() {
+        let id = invocation_id(Some("run:bin$foo::bar/../baz#2"), 7, "suffix");
+        assert!(!id.contains('/'));
+        assert!(!id.contains('$'));
+        assert!(!id.contains(':'));
+        assert_ne!(id, ".");
+        assert_ne!(id, "..");
+        assert_eq!(id, sanitize_path_component(&id));
+    }
+
+    #[test]
+    fn sanitize_path_component_rejects_parent_and_empty() {
+        assert_eq!(sanitize_path_component(".."), "inv");
+        assert_eq!(sanitize_path_component("."), "inv");
+        assert_eq!(sanitize_path_component(""), "inv");
+        assert_eq!(sanitize_path_component("foo$bar"), "foo_bar");
+    }
+
+    #[test]
+    fn remote_paths_are_unique_per_invocation_for_the_same_binary() {
+        let first = RemoteInvocation::new("crate-tests", &invocation_id(None, 11, "aaa"));
+        let second = RemoteInvocation::new("crate-tests", &invocation_id(None, 12, "bbb"));
+        assert_disjoint_remote_invocations(&first, &second);
+        assert!(first.bin_path.ends_with("/crate-tests"));
+        assert!(second.bin_path.ends_with("/crate-tests"));
+        assert!(first.exit_code_file.ends_with("/exit_code"));
+        assert!(second.exit_code_file.ends_with("/exit_code"));
+    }
+
+    #[test]
+    fn nextest_parallel_attempts_do_not_share_remote_files() {
+        let run = "55459fda-13fe-406a-b4e3-0230fd52bb03";
+        let first = RemoteInvocation::new(
+            "crate-tests",
+            &invocation_id(Some(&format!("{run}:pkg::bin$mod::test_one")), 1, "x"),
+        );
+        let second = RemoteInvocation::new(
+            "crate-tests",
+            &invocation_id(Some(&format!("{run}:pkg::bin$mod::test_two")), 1, "x"),
+        );
+        assert_disjoint_remote_invocations(&first, &second);
     }
 }
