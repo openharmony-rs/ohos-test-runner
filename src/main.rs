@@ -18,8 +18,9 @@ use anyhow::{bail, Context};
 use log::debug;
 use md5::Md5;
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const TEST_BIN_DIR: &str = "/data/local/tmp/ohos-test-runner";
@@ -27,12 +28,17 @@ const TEST_BIN_DIR: &str = "/data/local/tmp/ohos-test-runner";
 /// Environment variable to select the device (hdc connect-key) to run the binary on.
 const HDC_TARGET_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_TARGET";
 
+/// Environment variable listing shared libraries which the binary needs at runtime and which
+/// the device does not provide, in the platform's `PATH` format. `cargo-ohos` sets it when the
+/// toolchain carries its own C++ runtime.
+const RUNTIME_LIBRARIES_ENV_VAR: &str = "OHOS_TEST_RUNNER_RUNTIME_LIBRARIES";
+
 const ENV_VAR_PREFIX: &str = "OHOS_TEST_RUNNER";
 
 /// The user-facing environment variables of this tool. Variables with the [`ENV_VAR_PREFIX`]
 /// which are neither listed here nor in [`INTERNAL_ENV_VARS`] are reported to the user
 /// as unknown.
-const KNOWN_ENV_VARS: &[&str] = &[HDC_TARGET_ENV_VAR];
+const KNOWN_ENV_VARS: &[&str] = &[HDC_TARGET_ENV_VAR, RUNTIME_LIBRARIES_ENV_VAR];
 
 /// Internal environment variables, which are recognized to avoid spurious warnings,
 /// but not advertised to users.
@@ -157,11 +163,77 @@ fn compute_device_hash(
     );
 }
 
+/// The shared libraries the binary needs on the device, as configured by
+/// [`RUNTIME_LIBRARIES_ENV_VAR`].
+fn runtime_libraries() -> Vec<PathBuf> {
+    match std::env::var_os(RUNTIME_LIBRARIES_ENV_VAR) {
+        Some(value) => parse_runtime_libraries(&value),
+        None => Vec::new(),
+    }
+}
+
+fn parse_runtime_libraries(value: &OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(value)
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect()
+}
+
+/// Sends the runtime libraries next to the binary, so `LD_LIBRARY_PATH` finds them there.
+///
+/// The libraries are identical for every binary of a `cargo test` run, so skip the transfer
+/// when the device already holds the same file.
+fn send_runtime_libraries_to_device(hdc: &Hdc, libraries: &[PathBuf]) -> anyhow::Result<()> {
+    for library in libraries {
+        if !library.is_file() {
+            bail!(
+                "Runtime library not found: {}. Check {RUNTIME_LIBRARIES_ENV_VAR}.",
+                library.display()
+            );
+        }
+        let name = library
+            .file_name()
+            .expect("A runtime library must have a filename")
+            .to_str()
+            .context("Runtime library names must be utf-8")?;
+        let on_device_path = format!("{TEST_BIN_DIR}/{name}");
+        if device_file_matches(hdc, library, &on_device_path)? {
+            debug!("The device already has an identical {name}, skipping the transfer");
+            continue;
+        }
+        send_file_to_device(hdc, library, &on_device_path, false)
+            .with_context(|| format!("Failed to send the runtime library {name} to the device"))?;
+    }
+    Ok(())
+}
+
+/// Whether the device holds a file with the same contents as `local_path`.
+///
+/// `hdc shell` reports success even when the command it ran failed, so anything which does not
+/// parse as a hash - a missing file, a missing hash tool - counts as "no" and leads to a
+/// transfer.
+fn device_file_matches(hdc: &Hdc, local_path: &Path, on_device_path: &str) -> anyhow::Result<bool> {
+    let output = hdc.shell(&["sha256sum", on_device_path])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Ok(device_hash) = parse_device_hash_output(&stdout) else {
+        return Ok(false);
+    };
+    Ok(device_hash == hash_file::<Sha256>(local_path)?)
+}
+
 /// Sends the binary at `local_bin_path` to the device.
 fn send_bin_to_device(
     hdc: &Hdc,
     local_bin_path: &Path,
     on_device_bin_path: &str,
+) -> anyhow::Result<()> {
+    send_file_to_device(hdc, local_bin_path, on_device_bin_path, true)
+}
+
+fn send_file_to_device(
+    hdc: &Hdc,
+    local_bin_path: &Path,
+    on_device_bin_path: &str,
+    executable: bool,
 ) -> anyhow::Result<()> {
     let output = hdc.shell(&["mkdir", "-p", TEST_BIN_DIR])?;
     ensure_hdc_shell_success(&output, "Failed to create test directory on device")?;
@@ -183,8 +255,10 @@ fn send_bin_to_device(
         log::warn!("Unexpected output from hdc. File transfer may have failed.");
     }
 
-    let output = hdc.shell(&["chmod", "+x", on_device_bin_path])?;
-    ensure_hdc_shell_success(&output, "Failed to mark test binary executable on device")?;
+    if executable {
+        let output = hdc.shell(&["chmod", "+x", on_device_bin_path])?;
+        ensure_hdc_shell_success(&output, "Failed to mark test binary executable on device")?;
+    }
 
     let sha256_hash = hash_file::<Sha256>(local_bin_path)?;
     let md5_hash = hash_file::<Md5>(local_bin_path)?;
@@ -288,6 +362,10 @@ Environment variables:
         The hdc connect-key (`hdc -t`) of the device to run the binary on. Required if
         multiple devices are attached, optional otherwise. Use `hdc list targets` to list
         the connect-keys of the attached devices.
+    {RUNTIME_LIBRARIES_ENV_VAR}
+        Shared libraries the binary needs but the device does not provide, separated like
+        `PATH`. They are sent next to the binary and found via `LD_LIBRARY_PATH`.
+        `cargo-ohos` sets this when the toolchain carries its own C++ runtime.
     RUST_LOG
         Log level of the runner itself, e.g. `debug`.
 
@@ -356,6 +434,9 @@ fn main() -> anyhow::Result<()> {
     send_bin_to_device(&hdc, bin_path, &on_device_bin_path)
         .context("Failed to send binary to device")?;
 
+    let runtime_libraries = runtime_libraries();
+    send_runtime_libraries_to_device(&hdc, &runtime_libraries)?;
+
     let exit_code_file = format!(
         "{}/last_exit_code-{}",
         TEST_BIN_DIR,
@@ -366,11 +447,13 @@ fn main() -> anyhow::Result<()> {
 
     // We don't really know how long the test program would run, so we can't set a reasonable
     // timeout. We just fallback to using hdc shell as a command again.
-    let mut command = format!(
-        "cd {} && {}",
-        shell_quote(TEST_BIN_DIR),
-        shell_quote(&on_device_bin_path)
-    );
+    let mut command = format!("cd {} && ", shell_quote(TEST_BIN_DIR));
+    if !runtime_libraries.is_empty() {
+        // The binary needs libraries the device does not provide, and musl searches neither
+        // the working directory nor the directory of the binary.
+        command.push_str(&format!("LD_LIBRARY_PATH={} ", shell_quote(TEST_BIN_DIR)));
+    }
+    command.push_str(&shell_quote(&on_device_bin_path));
     for arg in &remaining_args {
         command.push(' ');
         command.push_str(&shell_quote(arg));
@@ -414,8 +497,34 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_device_selection, hash_tool_missing, parse_device_hash_output, unknown_env_vars,
+        check_device_selection, hash_tool_missing, parse_device_hash_output,
+        parse_runtime_libraries, unknown_env_vars,
     };
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parses_runtime_libraries() {
+        let joined =
+            std::env::join_paths([PathBuf::from("/a/libc++.so"), PathBuf::from("/b/x.so")])
+                .expect("joinable");
+
+        assert_eq!(
+            parse_runtime_libraries(&joined),
+            [PathBuf::from("/a/libc++.so"), PathBuf::from("/b/x.so")]
+        );
+    }
+
+    #[test]
+    fn ignores_empty_runtime_library_entries() {
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        let value = OsString::from(format!("{separator}/a/libc++.so{separator}"));
+
+        assert_eq!(
+            parse_runtime_libraries(&value),
+            [PathBuf::from("/a/libc++.so")]
+        );
+    }
 
     #[test]
     fn detects_unknown_env_vars() {
@@ -423,6 +532,7 @@ mod tests {
             "PATH",
             "OHOS_TEST_RUNNER_HDC_TARGET",
             "OHOS_TEST_RUNNER_HDC_TARGETT",
+            "OHOS_TEST_RUNNER_RUNTIME_LIBRARIES",
             "OHOS_TEST_RUNNER_FUTURE_OPTION",
             "OHOS_TEST_RUNNER_INTEGRATION_TARGET",
             "OHOS_SDK_NATIVE",

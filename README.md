@@ -3,6 +3,15 @@
 A simple target runner to support running executables from `cargo test`, `cargo bench` and `cargo run` 
 on a connected (Open-)HarmonyOS device.
 
+## Integration with cargo-ohos
+
+This test runner is also used by [cargo-ohos], where you can just conveniently use 
+`cargo ohos test` to cross-compile and run tests on device. 
+`cargo-ohos` handles the cross-compilation setup (i.e. `cargo ohos build` makes compiling for OpenHarmony "just work")
+adn this crate handles the pushing and running on device step.
+
+[cargo-ohos]: https://github.com/openharmony-rs/cargo-ohos/
+
 ### Example
 
 After installing ohos-test-runner, configure your project to use the custom
@@ -19,6 +28,14 @@ cargo test --target aarch64-unknown-linux-ohos
 
 The example assumes that you already have a working build environment to cross-compile your project
 for OpenHarmony.
+
+### Limitations
+
+Tests run on-device, which means that tests which have assumptions about the filesystem contents may break.
+This is commonly the case for tests that reference resources from files checked in the local project, which
+won't exist on the device. There is no way for a test runner to know about such files, but potentially in
+the future we could add some configuration options to allow pushing some files or directories with the
+executable onto the device, so relative paths referenced from tests can resolve.
 
 ### Selecting a device
 
