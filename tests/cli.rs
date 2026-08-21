@@ -28,6 +28,10 @@ fn prints_help() {
             stdout.contains("OHOS_TEST_RUNNER_HDC_TARGET"),
             "`{flag}` output: {stdout}"
         );
+        assert!(
+            stdout.contains("OHOS_TEST_RUNNER_RUNTIME_LIBRARIES"),
+            "`{flag}` output: {stdout}"
+        );
     }
 }
 
