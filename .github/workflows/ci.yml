@@ -66,6 +66,8 @@ jobs:
           echo "$(dirname "${OHOS_SDK_NATIVE}")/toolchains" >> "$GITHUB_PATH"
         env:
           OHOS_SDK_NATIVE: ${{ steps.setup_sdk.outputs.ohos_sdk_native }}
+      # The parallel smoke test drives the runner through `cargo nextest`.
+      - uses: taiki-e/install-action@nextest
       - name: Start Oniro emulator
         uses: openharmony-rs/emulator-action@v1
       - name: Run OHOS smoke test

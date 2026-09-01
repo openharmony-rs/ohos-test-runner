@@ -34,6 +34,10 @@ const HDC_SERVER_UNREACHABLE: &str = "Connect server failed";
 /// passed to `-s`.
 const HDC_SERVER_REJECTED: &[&str] = &["-s content IP incorrect.", "-s content port incorrect."];
 
+/// Echoed by the device when it already holds the test binary. `hdc shell` reports success even
+/// when the command it ran failed, so the check has to look at the output instead of the status.
+const BIN_PRESENT_MARKER: &str = "OHOS_TEST_RUNNER_BIN_PRESENT";
+
 /// Environment variable to select the device (hdc connect-key) to run the binary on.
 const HDC_TARGET_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_TARGET";
 
@@ -225,6 +229,35 @@ fn reports(output: &[u8], message: &str) -> bool {
         .any(|line| line.trim() == message)
 }
 
+/// The device-side paths of a single runner invocation.
+///
+/// The binary lives in a directory named after its contents, so that concurrent invocations of
+/// the same build share it, and an invocation of a different build never overwrites a binary
+/// another invocation is currently executing. The exit code file is per process, since a pid is
+/// unique among the invocations which are alive at the same time.
+struct RemotePaths {
+    bin_dir: String,
+    bin: String,
+    exit_code_file: String,
+}
+
+impl RemotePaths {
+    fn new(bin_name: &str, local_sha256: &str, pid: u32) -> Self {
+        let content_id = local_sha256.get(..16).unwrap_or(local_sha256);
+        let bin_dir = format!("{TEST_BIN_DIR}/{content_id}");
+        Self {
+            bin: format!("{bin_dir}/{bin_name}"),
+            bin_dir,
+            exit_code_file: format!("{TEST_BIN_DIR}/exit_code-{pid}"),
+        }
+    }
+
+    /// The name the binary is transferred under, before it is renamed into place.
+    fn incoming_bin(&self, pid: u32) -> String {
+        format!("{}.{pid}.incoming", self.bin)
+    }
+}
+
 fn hash_file<D: Digest>(local_bin_path: &Path) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(local_bin_path)?;
     let mut hasher = D::new();
@@ -339,53 +372,118 @@ fn send_runtime_libraries_to_device(hdc: &Hdc, libraries: &[PathBuf]) -> anyhow:
             .to_str()
             .context("Runtime library names must be utf-8")?;
         let on_device_path = format!("{TEST_BIN_DIR}/{name}");
-        if device_file_matches(hdc, library, &on_device_path)? {
+        let local_sha256 = hash_file::<Sha256>(library)?;
+        if device_file_matches(hdc, &local_sha256, &on_device_path)? {
             debug!("The device already has an identical {name}, skipping the transfer");
             continue;
         }
-        send_file_to_device(hdc, library, &on_device_path, false)
+        send_file_to_device(hdc, library, &on_device_path)
+            .and_then(|()| verify_device_file(hdc, library, &on_device_path, &local_sha256))
             .with_context(|| format!("Failed to send the runtime library {name} to the device"))?;
     }
     Ok(())
 }
 
-/// Whether the device holds a file with the same contents as `local_path`.
+/// Whether the device holds a file with the same contents as the local file hashing to
+/// `local_sha256`.
 ///
 /// `hdc shell` reports success even when the command it ran failed, so anything which does not
 /// parse as a hash - a missing file, a missing hash tool - counts as "no" and leads to a
 /// transfer.
-fn device_file_matches(hdc: &Hdc, local_path: &Path, on_device_path: &str) -> anyhow::Result<bool> {
+fn device_file_matches(
+    hdc: &Hdc,
+    local_sha256: &str,
+    on_device_path: &str,
+) -> anyhow::Result<bool> {
     let output = hdc.shell(&["sha256sum", on_device_path])?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let Ok(device_hash) = parse_device_hash_output(&stdout) else {
         return Ok(false);
     };
-    Ok(device_hash == hash_file::<Sha256>(local_path)?)
+    Ok(device_hash == local_sha256)
 }
 
-/// Sends the binary at `local_bin_path` to the device.
-fn send_bin_to_device(
-    hdc: &Hdc,
-    local_bin_path: &Path,
-    on_device_bin_path: &str,
-) -> anyhow::Result<()> {
-    send_file_to_device(hdc, local_bin_path, on_device_bin_path, true)
-}
-
-fn send_file_to_device(
-    hdc: &Hdc,
-    local_bin_path: &Path,
-    on_device_bin_path: &str,
-    executable: bool,
-) -> anyhow::Result<()> {
-    let output = hdc.shell(&["mkdir", "-p", TEST_BIN_DIR])?;
+/// Creates the directories this invocation needs, and reports whether the device already holds
+/// the test binary.
+fn prepare_dirs_and_probe_bin(hdc: &Hdc, remote: &RemotePaths) -> anyhow::Result<bool> {
+    let command = format!(
+        "mkdir -p {} && test -x {} && echo {BIN_PRESENT_MARKER}",
+        shell_quote(&remote.bin_dir),
+        shell_quote(&remote.bin)
+    );
+    let output = hdc.shell(&[&command])?;
     ensure_hdc_shell_success(&output, "Failed to create test directory on device")?;
+    Ok(bin_is_present(&String::from_utf8_lossy(&output.stdout)))
+}
 
+fn bin_is_present(probe_stdout: &str) -> bool {
+    probe_stdout
+        .lines()
+        .any(|line| line.trim() == BIN_PRESENT_MARKER)
+}
+
+/// Installs the binary at `remote.bin`.
+///
+/// The binary is transferred under a temporary name and then renamed into place, because a
+/// concurrent invocation may be executing the file at `remote.bin`: overwriting a running binary
+/// fails with `Text file busy`, while replacing it by a rename is fine.
+fn install_bin_on_device(
+    hdc: &Hdc,
+    local_bin_path: &Path,
+    remote: &RemotePaths,
+    local_sha256: &str,
+    pid: u32,
+) -> anyhow::Result<()> {
+    let incoming = remote.incoming_bin(pid);
+    send_file_to_device(hdc, local_bin_path, &incoming)?;
+
+    let output = hdc.shell(&["chmod", "+x", &incoming])?;
+    ensure_hdc_shell_success(&output, "Failed to mark test binary executable on device")?;
+
+    verify_device_file(hdc, local_bin_path, &incoming, local_sha256)?;
+
+    let output = hdc.shell(&["mv", "-f", &incoming, &remote.bin])?;
+    ensure_hdc_shell_success(
+        &output,
+        "Failed to move the test binary into place on device",
+    )
+}
+
+/// Removes the directories holding other builds of the same binary.
+///
+/// Only called after a transfer, i.e. once per build, and best-effort: an invocation of a build
+/// which is pruned while it runs keeps its already running processes, and transfers the binary
+/// again for the next test.
+fn prune_other_builds(hdc: &Hdc, bin_name: &str, remote: &RemotePaths) {
+    let command = prune_other_builds_command(bin_name, remote);
+    match hdc.shell(&[&command]) {
+        Ok(output) if !output.status.success() => log::warn!(
+            "Failed to remove the directories of other builds of {bin_name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(err) => {
+            log::warn!("Failed to remove the directories of other builds of {bin_name}: {err}")
+        }
+        Ok(_) => {}
+    }
+}
+
+fn prune_other_builds_command(bin_name: &str, remote: &RemotePaths) -> String {
+    format!(
+        "for dir in {TEST_BIN_DIR}/*/; do \
+         if [ \"$dir\" != {} ] && [ -e \"$dir\"{} ]; then rm -rf \"$dir\"; fi; done",
+        shell_quote(&format!("{}/", remote.bin_dir)),
+        shell_quote(bin_name)
+    )
+}
+
+/// Sends `local_path` to `on_device_path`. The parent directory must already exist.
+fn send_file_to_device(hdc: &Hdc, local_path: &Path, on_device_path: &str) -> anyhow::Result<()> {
     let res = hdc.output(
         hdc.command()
             .args(["file", "send"])
-            .arg(local_bin_path)
-            .arg(TEST_BIN_DIR),
+            .arg(local_path)
+            .arg(on_device_path),
     )?;
     assert!(res.status.success());
     // Captured to recognize an unreachable server, but meant for the user.
@@ -394,22 +492,21 @@ fn send_file_to_device(
         // Don't bail for now, we still verify the file hash below anyway.
         log::warn!("Unexpected output from hdc. File transfer may have failed.");
     }
+    Ok(())
+}
 
-    if executable {
-        let output = hdc.shell(&["chmod", "+x", on_device_bin_path])?;
-        ensure_hdc_shell_success(&output, "Failed to mark test binary executable on device")?;
-    }
-
-    let sha256_hash = hash_file::<Sha256>(local_bin_path)?;
-    let md5_hash = hash_file::<Md5>(local_bin_path)?;
-    debug!("The local sha256 hash is {sha256_hash:?}");
-    debug!("The local md5 hash is {md5_hash:?}");
-
-    let device_hash = if let Some(hash) = compute_device_hash(hdc, "sha256sum", on_device_bin_path)?
-    {
-        ("sha256sum", sha256_hash, hash)
-    } else if let Some(hash) = compute_device_hash(hdc, "md5sum", on_device_bin_path)? {
-        ("md5sum", md5_hash, hash)
+/// Checks that the transferred file arrived intact, using the strongest hash tool the device has.
+fn verify_device_file(
+    hdc: &Hdc,
+    local_path: &Path,
+    on_device_path: &str,
+    local_sha256: &str,
+) -> anyhow::Result<()> {
+    debug!("The local sha256 hash is {local_sha256:?}");
+    let device_hash = if let Some(hash) = compute_device_hash(hdc, "sha256sum", on_device_path)? {
+        ("sha256sum", local_sha256.to_owned(), hash)
+    } else if let Some(hash) = compute_device_hash(hdc, "md5sum", on_device_path)? {
+        ("md5sum", hash_file::<Md5>(local_path)?, hash)
     } else {
         bail!("Neither sha256sum nor md5sum is available on the device");
     };
@@ -563,26 +660,36 @@ fn main() -> anyhow::Result<()> {
     if !bin_path.exists() {
         bail!("Binary not found: {}", bin_path.display());
     }
-    let bin_name = bin_path.file_name().expect("Test bin must have a filename");
-    let on_device_bin_path = format!("{TEST_BIN_DIR}/{}", bin_name.to_str().expect("utf-8"));
+    let bin_name = bin_path
+        .file_name()
+        .expect("Test bin must have a filename")
+        .to_str()
+        .expect("utf-8");
+    let pid = std::process::id();
+    let local_sha256 = hash_file::<Sha256>(bin_path)?;
+    let remote = RemotePaths::new(bin_name, &local_sha256, pid);
     debug!("Bin_path: {:?}", bin_path);
+    debug!(
+        "On device: {}, exit code file: {}",
+        remote.bin, remote.exit_code_file
+    );
 
     let targets = hdc.list_targets()?;
     check_device_selection(&targets, hdc.target.as_deref())?;
 
-    send_bin_to_device(&hdc, bin_path, &on_device_bin_path)
-        .context("Failed to send binary to device")?;
+    if prepare_dirs_and_probe_bin(&hdc, &remote).context("Failed to prepare the device")? {
+        debug!(
+            "The device already has {}, skipping the transfer",
+            remote.bin
+        );
+    } else {
+        install_bin_on_device(&hdc, bin_path, &remote, &local_sha256, pid)
+            .context("Failed to send binary to device")?;
+        prune_other_builds(&hdc, bin_name, &remote);
+    }
 
     let runtime_libraries = runtime_libraries();
     send_runtime_libraries_to_device(&hdc, &runtime_libraries)?;
-
-    let exit_code_file = format!(
-        "{}/last_exit_code-{}",
-        TEST_BIN_DIR,
-        bin_name.to_str().expect("utf-8")
-    );
-    let output = hdc.shell(&["rm", "-f", &exit_code_file])?;
-    ensure_hdc_shell_success(&output, "Failed to clear device exit code file")?;
 
     // We don't really know how long the test program would run, so we can't set a reasonable
     // timeout. We just fallback to using hdc shell as a command again.
@@ -592,13 +699,13 @@ fn main() -> anyhow::Result<()> {
         // the working directory nor the directory of the binary.
         command.push_str(&format!("LD_LIBRARY_PATH={} ", shell_quote(TEST_BIN_DIR)));
     }
-    command.push_str(&shell_quote(&on_device_bin_path));
+    command.push_str(&shell_quote(&remote.bin));
     for arg in &remaining_args {
         command.push(' ');
         command.push_str(&shell_quote(arg));
     }
     command.push_str("; printf '%s' \"$?\" > ");
-    command.push_str(&shell_quote(&exit_code_file));
+    command.push_str(&shell_quote(&remote.exit_code_file));
 
     let res = hdc
         .command()
@@ -612,7 +719,10 @@ fn main() -> anyhow::Result<()> {
         bail!("Non zero exit code from hdc: {res}");
     }
 
-    let res = hdc.shell(&["cat", &exit_code_file])?;
+    // Reading and removing the file in one go keeps invocations which are killed before this
+    // point as the only ones which leave anything behind.
+    let exit_code_file = shell_quote(&remote.exit_code_file);
+    let res = hdc.shell(&[&format!("cat {exit_code_file}; rm -f {exit_code_file}")])?;
     if !res.status.success() {
         bail!("Non zero exit code from hdc: {res:?}");
     }
@@ -627,9 +737,10 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_device_selection, hash_tool_missing, parse_device_hash_output,
-        parse_runtime_libraries, reports, resolve_server, unknown_env_vars, Hdc,
-        HDC_SERVER_REJECTED, HDC_SERVER_UNREACHABLE,
+        bin_is_present, check_device_selection, hash_tool_missing, parse_device_hash_output,
+        parse_runtime_libraries, prune_other_builds_command, reports, resolve_server,
+        unknown_env_vars, Hdc, RemotePaths, BIN_PRESENT_MARKER, HDC_SERVER_REJECTED,
+        HDC_SERVER_UNREACHABLE, TEST_BIN_DIR,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -781,5 +892,56 @@ mod tests {
     fn detects_toybox_missing_hash_tool() {
         let output = "toybox: Unknown command sha256sum (see \"toybox --help\")\n";
         assert!(hash_tool_missing(output, "sha256sum"));
+    }
+
+    const HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const HASH_B: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn remote_paths_are_shared_per_build_and_private_per_process() {
+        let first = RemotePaths::new("crate-tests", HASH_A, 11);
+        let second = RemotePaths::new("crate-tests", HASH_A, 12);
+        let other_build = RemotePaths::new("crate-tests", HASH_B, 11);
+
+        // Two invocations of the same build reuse the transferred binary ...
+        assert_eq!(first.bin, second.bin);
+        // ... but must not write each other's exit code.
+        assert_ne!(first.exit_code_file, second.exit_code_file);
+        // A different build is transferred next to it, never over it.
+        assert_ne!(first.bin_dir, other_build.bin_dir);
+        assert_ne!(first.bin, other_build.bin);
+        assert_ne!(first.bin, first.incoming_bin(11));
+
+        for path in [&first.bin_dir, &first.bin, &first.exit_code_file] {
+            assert!(path.starts_with(&format!("{TEST_BIN_DIR}/")), "{path}");
+        }
+        assert!(first.bin.ends_with("/crate-tests"), "{}", first.bin);
+    }
+
+    #[test]
+    fn detects_the_binary_present_marker() {
+        // hdc terminates the lines of a shell command with CRLF.
+        assert!(bin_is_present(&format!("{BIN_PRESENT_MARKER}\r\n")));
+        assert!(bin_is_present(&format!(
+            "[Fail]Some hdc notice\r\n{BIN_PRESENT_MARKER}\r\n"
+        )));
+        // `test -x` failed, so the binary has to be transferred.
+        assert!(!bin_is_present(""));
+        // A shell which could not run the command must not look like a hit.
+        assert!(!bin_is_present(&format!(
+            "sh: echo {BIN_PRESENT_MARKER}: not found\r\n"
+        )));
+    }
+
+    #[test]
+    fn pruning_quotes_the_binary_name_and_keeps_the_current_build() {
+        let remote = RemotePaths::new("odd name'; rm -rf /", HASH_A, 11);
+        let command = prune_other_builds_command("odd name'; rm -rf /", &remote);
+
+        assert!(command.contains(r"'odd name'\''; rm -rf /'"), "{command}");
+        assert!(
+            command.contains(&format!("!= '{}/'", remote.bin_dir)),
+            "{command}"
+        );
     }
 }

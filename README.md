@@ -75,6 +75,26 @@ Environment variables starting with `OHOS_TEST_RUNNER` which are not known to th
 are reported with a warning, since they are likely typos, or configuration for a newer version of
 this tool. Run `ohos-test-runner --help` for the list of supported variables.
 
+### Running tests in parallel
+
+Several runner invocations may target the same device at the same time. This is what
+`cargo nextest` does, since it starts one process - and therefore one runner - per test.
+
+Each invocation writes its exit code to a file of its own, and the test binary is transferred
+into a directory named after its contents:
+
+```
+/data/local/tmp/ohos-test-runner/<hash of the binary>/<binary>
+```
+
+All the invocations of a build therefore share one transfer, instead of pushing the binary again
+for every test, and the transfer of a new build never overwrites a binary another invocation is
+currently executing. The directory of the previous build is removed once the new one arrives.
+
+Versions up to 0.1.5 placed the binaries and their exit code files directly in
+`/data/local/tmp/ohos-test-runner`, and never removed them. Those leftovers are not used anymore
+and can be deleted with `hdc shell rm -f /data/local/tmp/ohos-test-runner/last_exit_code-*`.
+
 ### License 
 
 Licensed under the Apache-2.0 license.
