@@ -91,6 +91,12 @@ All the invocations of a build therefore share one transfer, instead of pushing 
 for every test, and the transfer of a new build never overwrites a binary another invocation is
 currently executing. The directory of the previous build is removed once the new one arrives.
 
+A build is kept only as long as it is being used. Every run marks the build it uses, and a
+transfer - the only moment the directory grows - first removes the builds which have gone unused
+for 30 minutes, along with the exit code files and half-finished transfers of runs which were
+killed. `OHOS_TEST_RUNNER_CACHE_TTL_MINUTES` changes that window; it only has to outlast a single
+`cargo test` or `cargo nextest run`, since a rebuild replaces its build directory anyway.
+
 Versions up to 0.1.5 placed the binaries and their exit code files directly in
 `/data/local/tmp/ohos-test-runner`, and never removed them. Those leftovers are not used anymore
 and can be deleted with `hdc shell rm -f /data/local/tmp/ohos-test-runner/last_exit_code-*`.

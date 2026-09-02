@@ -34,9 +34,18 @@ const HDC_SERVER_UNREACHABLE: &str = "Connect server failed";
 /// passed to `-s`.
 const HDC_SERVER_REJECTED: &[&str] = &["-s content IP incorrect.", "-s content port incorrect."];
 
-/// Echoed by the device when it already holds the test binary. `hdc shell` reports success even
-/// when the command it ran failed, so the check has to look at the output instead of the status.
-const BIN_PRESENT_MARKER: &str = "OHOS_TEST_RUNNER_BIN_PRESENT";
+/// Written to the exit code file when the device turned out not to hold the test binary.
+///
+/// The presence check runs in the same command as the test, so that nothing can collect the
+/// binary between the two. Reporting the miss through the exit code file, which is read anyway,
+/// keeps the output of the test itself untouched.
+const BIN_MISSING: &str = "missing";
+
+/// How long a build stays on the device after its last use, in minutes.
+///
+/// The cache only has to survive one `cargo test` or `cargo nextest run`, which invokes the same
+/// binary many times over seconds to minutes. Anything longer only fills up the device.
+const DEFAULT_CACHE_TTL_MINUTES: u64 = 30;
 
 /// Environment variable to select the device (hdc connect-key) to run the binary on.
 const HDC_TARGET_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_TARGET";
@@ -44,6 +53,9 @@ const HDC_TARGET_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_TARGET";
 /// Environment variable naming the hdc server (`hdc -s`) to use, as `<host>:<port>`, for a
 /// device attached to another machine.
 const HDC_SERVER_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_SERVER";
+
+/// Environment variable overriding [`DEFAULT_CACHE_TTL_MINUTES`].
+const CACHE_TTL_ENV_VAR: &str = "OHOS_TEST_RUNNER_CACHE_TTL_MINUTES";
 
 /// Environment variable listing shared libraries which the binary needs at runtime and which
 /// the device does not provide, in the platform's `PATH` format. `cargo-ohos` sets it when the
@@ -59,6 +71,7 @@ const KNOWN_ENV_VARS: &[&str] = &[
     HDC_TARGET_ENV_VAR,
     HDC_SERVER_ENV_VAR,
     RUNTIME_LIBRARIES_ENV_VAR,
+    CACHE_TTL_ENV_VAR,
 ];
 
 /// Internal environment variables, which are recognized to avoid spurious warnings,
@@ -403,23 +416,85 @@ fn device_file_matches(
     Ok(device_hash == local_sha256)
 }
 
-/// Creates the directories this invocation needs, and reports whether the device already holds
-/// the test binary.
-fn prepare_dirs_and_probe_bin(hdc: &Hdc, remote: &RemotePaths) -> anyhow::Result<bool> {
-    let command = format!(
-        "mkdir -p {} && test -x {} && echo {BIN_PRESENT_MARKER}",
+/// The command which runs the test binary on the device, if the device still has it.
+///
+/// The presence check, the `touch` which marks the build as still in use, and the test itself
+/// are one command, so that the garbage collection of another invocation cannot remove the
+/// binary in between. A test which is already running survives its build directory being
+/// removed, since the device keeps the file open.
+fn run_command(remote: &RemotePaths, args: &[String], with_runtime_libraries: bool) -> String {
+    let mut run = format!(
+        "touch {} && cd {} && ",
         shell_quote(&remote.bin_dir),
-        shell_quote(&remote.bin)
+        shell_quote(TEST_BIN_DIR)
     );
-    let output = hdc.shell(&[&command])?;
-    ensure_hdc_shell_success(&output, "Failed to create test directory on device")?;
-    Ok(bin_is_present(&String::from_utf8_lossy(&output.stdout)))
+    if with_runtime_libraries {
+        // The binary needs libraries the device does not provide, and musl searches neither
+        // the working directory nor the directory of the binary.
+        run.push_str(&format!("LD_LIBRARY_PATH={} ", shell_quote(TEST_BIN_DIR)));
+    }
+    run.push_str(&shell_quote(&remote.bin));
+    for arg in args {
+        run.push(' ');
+        run.push_str(&shell_quote(arg));
+    }
+    let exit_code_file = shell_quote(&remote.exit_code_file);
+    format!(
+        "if [ -x {bin} ]; then {run}; printf '%s' \"$?\" > {exit_code_file}; \
+         else mkdir -p {bin_dir}; printf '%s' {missing} > {exit_code_file}; fi",
+        bin = shell_quote(&remote.bin),
+        bin_dir = shell_quote(&remote.bin_dir),
+        missing = shell_quote(BIN_MISSING),
+    )
 }
 
-fn bin_is_present(probe_stdout: &str) -> bool {
-    probe_stdout
-        .lines()
-        .any(|line| line.trim() == BIN_PRESENT_MARKER)
+/// Removes the builds which have not been used for `ttl_minutes`, and the files left behind by
+/// invocations which were killed.
+///
+/// Called only before a transfer, so that the device directory is collected whenever it is about
+/// to grow. Best-effort: a failure here costs space, not correctness.
+fn collect_garbage(hdc: &Hdc, ttl_minutes: u64) {
+    let command = collect_garbage_command(ttl_minutes);
+    match hdc.shell(&[&command]) {
+        Ok(output) if !output.status.success() => log::warn!(
+            "Failed to collect old builds on the device: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(err) => log::warn!("Failed to collect old builds on the device: {err}"),
+        Ok(_) => {}
+    }
+}
+
+fn collect_garbage_command(ttl_minutes: u64) -> String {
+    format!(
+        "find {TEST_BIN_DIR} -mindepth 1 -maxdepth 1 -type d -mmin +{ttl_minutes} \
+         -exec rm -rf {{}} + ; \
+         find {TEST_BIN_DIR} -mindepth 1 -maxdepth 1 -name 'exit_code-*' -mmin +{ttl_minutes} \
+         -exec rm -f {{}} + ; \
+         find {TEST_BIN_DIR} -mindepth 2 -maxdepth 2 -name '*.incoming' -mmin +{ttl_minutes} \
+         -exec rm -f {{}} +"
+    )
+}
+
+/// How long an unused build stays on the device, from [`CACHE_TTL_ENV_VAR`].
+fn cache_ttl_minutes() -> u64 {
+    parse_cache_ttl(std::env::var_os(CACHE_TTL_ENV_VAR).as_deref())
+}
+
+fn parse_cache_ttl(value: Option<&OsStr>) -> u64 {
+    let Some(value) = value else {
+        return DEFAULT_CACHE_TTL_MINUTES;
+    };
+    match value.to_str().map(str::trim).map(str::parse::<u64>) {
+        Some(Ok(minutes)) => minutes,
+        _ => {
+            eprintln!(
+                "warning: `{CACHE_TTL_ENV_VAR}` is not a number of minutes, using \
+                 {DEFAULT_CACHE_TTL_MINUTES}"
+            );
+            DEFAULT_CACHE_TTL_MINUTES
+        }
+    }
 }
 
 /// Installs the binary at `remote.bin`.
@@ -520,6 +595,38 @@ fn verify_device_file(
     Ok(())
 }
 
+/// Runs `command` on the device, letting the output of the test through to the caller.
+///
+/// We don't really know how long the test program would run, so we can't set a reasonable
+/// timeout. We just fallback to using hdc shell as a command again.
+fn run_on_device(hdc: &Hdc, command: &str) -> anyhow::Result<()> {
+    let res = hdc
+        .command()
+        .arg("shell")
+        .arg(command)
+        .spawn()
+        .expect("Failed to run hdc")
+        .wait()
+        .expect("Failed to get output of hdc");
+    if !res.success() {
+        bail!("Non zero exit code from hdc: {res}");
+    }
+    Ok(())
+}
+
+/// Reads the exit code the run left on the device, removing the file as it does.
+///
+/// Removing it here leaves the invocations which are killed before this point as the only ones
+/// which leave anything behind.
+fn read_exit_code(hdc: &Hdc, remote: &RemotePaths) -> anyhow::Result<String> {
+    let exit_code_file = shell_quote(&remote.exit_code_file);
+    let res = hdc.shell(&[&format!("cat {exit_code_file}; rm -f {exit_code_file}")])?;
+    if !res.status.success() {
+        bail!("Non zero exit code from hdc: {res:?}");
+    }
+    Ok(String::from_utf8_lossy(&res.stdout).into_owned())
+}
+
 /// Checks that the requested device - or the only connected device, if none was requested -
 /// is available.
 fn check_device_selection(
@@ -608,6 +715,10 @@ Environment variables:
         Shared libraries the binary needs but the device does not provide, separated like
         `PATH`. They are sent next to the binary and found via `LD_LIBRARY_PATH`.
         `cargo-ohos` sets this when the toolchain carries its own C++ runtime.
+    {CACHE_TTL_ENV_VAR}
+        How many minutes a build stays on the device after its last use ({ttl} by
+        default). The invocations of one `cargo test` or `cargo nextest run` share the
+        binary they transferred, and it is collected once it goes unused for this long.
     RUST_LOG
         Log level of the runner itself, e.g. `debug`.
 
@@ -620,6 +731,7 @@ Example:
         name = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
+        ttl = DEFAULT_CACHE_TTL_MINUTES,
     );
 }
 
@@ -677,58 +789,30 @@ fn main() -> anyhow::Result<()> {
     let targets = hdc.list_targets()?;
     check_device_selection(&targets, hdc.target.as_deref())?;
 
-    if prepare_dirs_and_probe_bin(&hdc, &remote).context("Failed to prepare the device")? {
-        debug!(
-            "The device already has {}, skipping the transfer",
-            remote.bin
-        );
-    } else {
-        install_bin_on_device(&hdc, bin_path, &remote, &local_sha256, pid)
-            .context("Failed to send binary to device")?;
-        prune_other_builds(&hdc, bin_name, &remote);
-    }
-
     let runtime_libraries = runtime_libraries();
     send_runtime_libraries_to_device(&hdc, &runtime_libraries)?;
 
-    // We don't really know how long the test program would run, so we can't set a reasonable
-    // timeout. We just fallback to using hdc shell as a command again.
-    let mut command = format!("cd {} && ", shell_quote(TEST_BIN_DIR));
-    if !runtime_libraries.is_empty() {
-        // The binary needs libraries the device does not provide, and musl searches neither
-        // the working directory nor the directory of the binary.
-        command.push_str(&format!("LD_LIBRARY_PATH={} ", shell_quote(TEST_BIN_DIR)));
-    }
-    command.push_str(&shell_quote(&remote.bin));
-    for arg in &remaining_args {
-        command.push(' ');
-        command.push_str(&shell_quote(arg));
-    }
-    command.push_str("; printf '%s' \"$?\" > ");
-    command.push_str(&shell_quote(&remote.exit_code_file));
+    let command = run_command(&remote, &remaining_args, !runtime_libraries.is_empty());
+    let mut transferred = false;
+    let exit_code = loop {
+        run_on_device(&hdc, &command)?;
+        let exit_code = read_exit_code(&hdc, &remote)?;
+        if exit_code.trim() != BIN_MISSING {
+            break exit_code;
+        }
+        if transferred {
+            bail!("The test binary disappeared from the device before it could be run");
+        }
+        debug!("The device does not have {}, transferring it", remote.bin);
+        collect_garbage(&hdc, cache_ttl_minutes());
+        install_bin_on_device(&hdc, bin_path, &remote, &local_sha256, pid)
+            .context("Failed to send binary to device")?;
+        prune_other_builds(&hdc, bin_name, &remote);
+        transferred = true;
+    };
 
-    let res = hdc
-        .command()
-        .arg("shell")
-        .arg(&command)
-        .spawn()
-        .expect("Failed to run hdc")
-        .wait()
-        .expect("Failed to get output of hdc");
-    if !res.success() {
-        bail!("Non zero exit code from hdc: {res}");
-    }
-
-    // Reading and removing the file in one go keeps invocations which are killed before this
-    // point as the only ones which leave anything behind.
-    let exit_code_file = shell_quote(&remote.exit_code_file);
-    let res = hdc.shell(&[&format!("cat {exit_code_file}; rm -f {exit_code_file}")])?;
-    if !res.status.success() {
-        bail!("Non zero exit code from hdc: {res:?}");
-    }
-    let stdout = String::from_utf8_lossy(&res.stdout);
-    if stdout.trim() != "0" {
-        bail!("Binary exited with Non-zero code: {stdout}");
+    if exit_code.trim() != "0" {
+        bail!("Binary exited with Non-zero code: {exit_code}");
     }
 
     Ok(())
@@ -737,12 +821,12 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bin_is_present, check_device_selection, hash_tool_missing, parse_device_hash_output,
-        parse_runtime_libraries, prune_other_builds_command, reports, resolve_server,
-        unknown_env_vars, Hdc, RemotePaths, BIN_PRESENT_MARKER, HDC_SERVER_REJECTED,
-        HDC_SERVER_UNREACHABLE, TEST_BIN_DIR,
+        check_device_selection, collect_garbage_command, hash_tool_missing, parse_cache_ttl,
+        parse_device_hash_output, parse_runtime_libraries, prune_other_builds_command, reports,
+        resolve_server, run_command, unknown_env_vars, Hdc, RemotePaths, BIN_MISSING,
+        DEFAULT_CACHE_TTL_MINUTES, HDC_SERVER_REJECTED, HDC_SERVER_UNREACHABLE, TEST_BIN_DIR,
     };
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
     #[test]
@@ -919,18 +1003,71 @@ mod tests {
     }
 
     #[test]
-    fn detects_the_binary_present_marker() {
-        // hdc terminates the lines of a shell command with CRLF.
-        assert!(bin_is_present(&format!("{BIN_PRESENT_MARKER}\r\n")));
-        assert!(bin_is_present(&format!(
-            "[Fail]Some hdc notice\r\n{BIN_PRESENT_MARKER}\r\n"
-        )));
-        // `test -x` failed, so the binary has to be transferred.
-        assert!(!bin_is_present(""));
-        // A shell which could not run the command must not look like a hit.
-        assert!(!bin_is_present(&format!(
-            "sh: echo {BIN_PRESENT_MARKER}: not found\r\n"
-        )));
+    fn the_run_command_checks_for_the_binary_and_runs_it_in_one_go() {
+        let remote = RemotePaths::new("crate-tests", HASH_A, 11);
+        let command = run_command(&remote, &["--exact".to_owned(), "a::b".to_owned()], false);
+
+        // Nothing may collect the binary between the check and the run, ...
+        assert!(
+            command.contains(&format!("if [ -x '{}' ]", remote.bin)),
+            "{command}"
+        );
+        // ... and running it marks the build as still in use.
+        assert!(
+            command.contains(&format!("touch '{}'", remote.bin_dir)),
+            "{command}"
+        );
+        assert!(command.contains("'--exact' 'a::b'"), "{command}");
+        assert!(
+            command.contains(&format!("> '{}'", remote.exit_code_file)),
+            "{command}"
+        );
+        // A miss is reported through the exit code file, so that the output of the test itself
+        // stays untouched.
+        assert!(command.contains(&format!("'{BIN_MISSING}'")), "{command}");
+        assert!(!command.contains("LD_LIBRARY_PATH"), "{command}");
+    }
+
+    #[test]
+    fn the_run_command_sets_ld_library_path_for_runtime_libraries() {
+        let remote = RemotePaths::new("crate-tests", HASH_A, 11);
+        let command = run_command(&remote, &[], true);
+
+        assert!(
+            command.contains(&format!("LD_LIBRARY_PATH='{TEST_BIN_DIR}'")),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn garbage_collection_covers_builds_and_the_files_of_killed_invocations() {
+        let command = collect_garbage_command(30);
+
+        assert!(command.contains("-type d -mmin +30"), "{command}");
+        assert!(
+            command.contains("-name 'exit_code-*' -mmin +30"),
+            "{command}"
+        );
+        assert!(
+            command.contains("-name '*.incoming' -mmin +30"),
+            "{command}"
+        );
+        // The runtime libraries sit next to the build directories and are not collected.
+        assert!(!command.contains("-name '*.so'"), "{command}");
+    }
+
+    #[test]
+    fn the_cache_ttl_falls_back_to_the_default() {
+        assert_eq!(parse_cache_ttl(Some(OsStr::new(" 5 "))), 5);
+        assert_eq!(parse_cache_ttl(None), DEFAULT_CACHE_TTL_MINUTES);
+        assert_eq!(
+            parse_cache_ttl(Some(OsStr::new("half an hour"))),
+            DEFAULT_CACHE_TTL_MINUTES
+        );
+        assert_eq!(
+            parse_cache_ttl(Some(OsStr::new("-1"))),
+            DEFAULT_CACHE_TTL_MINUTES
+        );
     }
 
     #[test]

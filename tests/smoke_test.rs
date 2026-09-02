@@ -182,6 +182,15 @@ fn run_fixture_test_case_with_env(
 }
 
 fn write_smoke_test_fixture(project_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    write_smoke_test_fixture_with_marker(project_dir, "")
+}
+
+/// `marker` changes the contents of the built binary, and with it the directory it is
+/// transferred to.
+fn write_smoke_test_fixture_with_marker(
+    project_dir: &Path,
+    marker: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(project_dir.join("tests"))?;
     let fixture_package_name = project_dir
         .file_name()
@@ -202,7 +211,7 @@ fn write_smoke_test_fixture(project_dir: &Path) -> Result<(), Box<dyn std::error
     fs::write(
         project_dir.join("tests").join(format!("{fixture_test_name}.rs")),
         format!(
-            "#[test]\nfn {FIXTURE_PASSING_CASE}() {{\n    println!(\"runner smoke test executed\");\n}}\n\n#[test]\nfn {FIXTURE_FAILING_CASE}() {{\n    panic!(\"intentional smoke-test failure\");\n}}\n"
+            "#[test]\nfn {FIXTURE_PASSING_CASE}() {{\n    println!(\"runner smoke test executed {marker}\");\n}}\n\n#[test]\nfn {FIXTURE_FAILING_CASE}() {{\n    panic!(\"intentional smoke-test failure\");\n}}\n"
         ),
     )?;
     Ok(())
@@ -270,6 +279,12 @@ impl Drop for TempProject {
 /// The directory the runner uses on the device. Kept in sync with `src/main.rs` by hand, since
 /// integration tests cannot see the internals of a binary crate.
 const TEST_BIN_DIR: &str = "/data/local/tmp/ohos-test-runner";
+/// Names for the entries the collection test plants on the device. Hex, like the directories
+/// the runner creates, but not a hash any build has.
+const STALE_BUILD_DIR: &str = "aaaaaaaaaaaaaaaa";
+const FRESH_BUILD_DIR: &str = "bbbbbbbbbbbbbbbb";
+/// A pid no invocation can have, so the other smoke tests never own this file.
+const STALE_EXIT_CODE_FILE: &str = "exit_code-4294967295";
 const PARALLEL_TEST_COUNT: usize = 16;
 /// Enough padding for the transfer of the fixture to take long enough to overlap the invocations
 /// which follow it. The runner before per-invocation exit code files fails this test reliably at
@@ -343,6 +358,69 @@ fn parallel_nextest_runs_share_one_transfer() -> Result<(), Box<dyn std::error::
 
     wait_until_no_exit_code_files_are_left()?;
 
+    Ok(())
+}
+
+/// Builds which have gone unused, and the files of invocations which were killed, are removed
+/// once the device directory is about to grow again.
+#[test]
+#[ignore = "requires an OpenHarmony target toolchain, linker setup, hdc, and a connected device"]
+fn unused_builds_are_collected() -> Result<(), Box<dyn std::error::Error>> {
+    let project = TempProject::new()?;
+    write_smoke_test_fixture(project.path())?;
+    let first_run = run_fixture_test_case(project.path(), FIXTURE_PASSING_CASE)?;
+    assert!(
+        first_run.status.success(),
+        "the first run of the fixture failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first_run.stdout),
+        String::from_utf8_lossy(&first_run.stderr)
+    );
+
+    // A build nobody has used for a while, a fresh build holding an interrupted transfer, and
+    // the exit code file of an invocation which was killed before it could read it.
+    let stale_build = format!("{TEST_BIN_DIR}/{STALE_BUILD_DIR}");
+    let fresh_build = format!("{TEST_BIN_DIR}/{FRESH_BUILD_DIR}");
+    let stale_exit_code = format!("{TEST_BIN_DIR}/{STALE_EXIT_CODE_FILE}");
+    let stale_incoming = format!("{fresh_build}/killed-transfer.incoming");
+    hdc_shell(&[&format!(
+        "mkdir -p {stale_build} {fresh_build}; touch {stale_incoming} {stale_exit_code}; \
+         touch -d '2020-01-01 00:00:00' {stale_build} {stale_incoming} {stale_exit_code}"
+    )])?;
+
+    // Changing the fixture gives the next run a binary of its own, so it has to transfer - which
+    // is when the collection runs.
+    write_smoke_test_fixture_with_marker(project.path(), "collected")?;
+    let second_run = run_fixture_test_case(project.path(), FIXTURE_PASSING_CASE)?;
+    assert!(
+        second_run.status.success(),
+        "the run after the rebuild failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&second_run.stdout),
+        String::from_utf8_lossy(&second_run.stderr)
+    );
+
+    let entries = entries_in(TEST_BIN_DIR)?;
+    assert!(
+        !entries.contains(&STALE_BUILD_DIR.to_owned()),
+        "the unused build was not collected, {TEST_BIN_DIR} holds: {entries:?}"
+    );
+    // Only the planted file: the other smoke tests run concurrently and have exit code files of
+    // their own in flight.
+    assert!(
+        !entries.contains(&STALE_EXIT_CODE_FILE.to_owned()),
+        "the exit code file of a killed invocation was not collected: {entries:?}"
+    );
+    // A build which is still in use stays, but the interrupted transfer inside it does not.
+    assert!(
+        entries.contains(&FRESH_BUILD_DIR.to_owned()),
+        "a build in use was collected, {TEST_BIN_DIR} holds: {entries:?}"
+    );
+    assert!(
+        entries_in(&fresh_build)?.is_empty(),
+        "the interrupted transfer was not collected: {:?}",
+        entries_in(&fresh_build)?
+    );
+
+    let _ = hdc_shell(&["rm", "-rf", &fresh_build]);
     Ok(())
 }
 
