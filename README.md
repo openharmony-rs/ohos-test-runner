@@ -29,13 +29,30 @@ cargo test --target aarch64-unknown-linux-ohos
 The example assumes that you already have a working build environment to cross-compile your project
 for OpenHarmony.
 
-### Limitations
+### Files the tests read
 
-Tests run on-device, which means that tests which have assumptions about the filesystem contents may break.
-This is commonly the case for tests that reference resources from files checked in the local project, which
-won't exist on the device. There is no way for a test runner to know about such files, but potentially in
-the future we could add some configuration options to allow pushing some files or directories with the
-executable onto the device, so relative paths referenced from tests can resolve.
+Tests run on-device, so a test which reads a file from the package finds nothing there unless the
+file is sent along. The runner cannot know which files a test opens, so they are declared in
+`OHOS_TEST_RUNNER_FIXTURES` - paths relative to the package root, separated like `PATH`, naming
+files or whole directories:
+
+```
+export OHOS_TEST_RUNNER_FIXTURES=tests/data:benches/corpus
+cargo test --target aarch64-unknown-linux-ohos
+```
+
+They are mirrored on the device in the same layout, and the test runs with that mirror as its
+working directory, so relative paths such as `tests/data/input.json` resolve as they do on the
+host. A test which reads `CARGO_MANIFEST_DIR` at runtime, with `std::env::var`, sees the mirror
+too.
+
+Two things cannot be supported. `env!("CARGO_MANIFEST_DIR")`, and any other absolute host path,
+is baked into the binary at compile time and can never exist on the device, whose root filesystem
+is read-only. And the mirror is for reading: a test which writes into its package root writes
+into a copy, which is eventually collected.
+
+The mirror is named after the contents of the files in it, so it is transferred once for a whole
+test run and shared by every test, and editing a fixture gives the next run a mirror of its own.
 
 ### Selecting a device
 

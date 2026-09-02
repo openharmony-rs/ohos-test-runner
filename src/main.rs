@@ -18,6 +18,7 @@ use anyhow::{bail, Context};
 use log::debug;
 use md5::Md5;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -41,6 +42,18 @@ const HDC_SERVER_REJECTED: &[&str] = &["-s content IP incorrect.", "-s content p
 /// keeps the output of the test itself untouched.
 const BIN_MISSING: &str = "missing";
 
+/// Marks a build directory, so that the pruning of old builds tells them from the directories
+/// holding the files a test reads.
+const BUILD_MARKER: &str = ".build";
+
+/// Marks a fixture directory whose transfer finished. A directory without it was left behind by
+/// an invocation which was killed, and is transferred again.
+const FIXTURES_MARKER: &str = ".ready";
+
+/// Echoed by the probe of the miss path for the parts the device already has.
+const HAVE_BIN_MARKER: &str = "OHOS_TEST_RUNNER_HAVE_BIN";
+const HAVE_FIXTURES_MARKER: &str = "OHOS_TEST_RUNNER_HAVE_FIXTURES";
+
 /// How long a build stays on the device after its last use, in minutes.
 ///
 /// The cache only has to survive one `cargo test` or `cargo nextest run`, which invokes the same
@@ -53,6 +66,10 @@ const HDC_TARGET_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_TARGET";
 /// Environment variable naming the hdc server (`hdc -s`) to use, as `<host>:<port>`, for a
 /// device attached to another machine.
 const HDC_SERVER_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_SERVER";
+
+/// Environment variable listing the files and directories a test reads at runtime, relative to
+/// the package root, in the platform's `PATH` format.
+const FIXTURES_ENV_VAR: &str = "OHOS_TEST_RUNNER_FIXTURES";
 
 /// Environment variable overriding [`DEFAULT_CACHE_TTL_MINUTES`].
 const CACHE_TTL_ENV_VAR: &str = "OHOS_TEST_RUNNER_CACHE_TTL_MINUTES";
@@ -71,6 +88,7 @@ const KNOWN_ENV_VARS: &[&str] = &[
     HDC_TARGET_ENV_VAR,
     HDC_SERVER_ENV_VAR,
     RUNTIME_LIBRARIES_ENV_VAR,
+    FIXTURES_ENV_VAR,
     CACHE_TTL_ENV_VAR,
 ];
 
@@ -252,16 +270,20 @@ struct RemotePaths {
     bin_dir: String,
     bin: String,
     exit_code_file: String,
+    /// The mirror of the package root, when the test reads files from it. Also the working
+    /// directory of the test, so that its relative paths resolve.
+    fixtures_dir: Option<String>,
 }
 
 impl RemotePaths {
-    fn new(bin_name: &str, local_sha256: &str, pid: u32) -> Self {
-        let content_id = local_sha256.get(..16).unwrap_or(local_sha256);
-        let bin_dir = format!("{TEST_BIN_DIR}/{content_id}");
+    fn new(bin_name: &str, local_sha256: &str, pid: u32, fixtures_sha256: Option<&str>) -> Self {
+        let bin_dir = format!("{TEST_BIN_DIR}/{}", content_id(local_sha256));
         Self {
             bin: format!("{bin_dir}/{bin_name}"),
             bin_dir,
             exit_code_file: format!("{TEST_BIN_DIR}/exit_code-{pid}"),
+            fixtures_dir: fixtures_sha256
+                .map(|hash| format!("{TEST_BIN_DIR}/{}", content_id(hash))),
         }
     }
 
@@ -269,6 +291,28 @@ impl RemotePaths {
     fn incoming_bin(&self, pid: u32) -> String {
         format!("{}.{pid}.incoming", self.bin)
     }
+
+    fn build_marker(&self) -> String {
+        format!("{}/{BUILD_MARKER}", self.bin_dir)
+    }
+
+    fn fixtures_marker(&self) -> Option<String> {
+        self.fixtures_dir
+            .as_ref()
+            .map(|dir| format!("{dir}/{FIXTURES_MARKER}"))
+    }
+
+    /// The working directory of the test: the mirror of the package root if there is one, and
+    /// the shared directory otherwise, which is where the runtime libraries live.
+    fn working_dir(&self) -> &str {
+        self.fixtures_dir.as_deref().unwrap_or(TEST_BIN_DIR)
+    }
+}
+
+/// The part of a hash which names a directory on the device. Long enough that the builds and
+/// fixture sets of one device never collide.
+fn content_id(sha256: &str) -> &str {
+    sha256.get(..16).unwrap_or(sha256)
 }
 
 fn hash_file<D: Digest>(local_bin_path: &Path) -> anyhow::Result<String> {
@@ -416,6 +460,215 @@ fn device_file_matches(
     Ok(device_hash == local_sha256)
 }
 
+/// The files and directories a test reads at runtime, from [`FIXTURES_ENV_VAR`].
+///
+/// They are mirrored on the device under the package root's relative layout, and the test runs
+/// with that mirror as its working directory, so that its relative paths resolve.
+struct Fixtures {
+    /// The package root on the host, which the device directory mirrors.
+    manifest_dir: PathBuf,
+    /// The declared entries, relative to `manifest_dir`.
+    entries: Vec<PathBuf>,
+}
+
+impl Fixtures {
+    /// The declaration, or `None` when the tests need no files of their own.
+    fn from_env() -> anyhow::Result<Option<Self>> {
+        let Some(value) = std::env::var_os(FIXTURES_ENV_VAR) else {
+            return Ok(None);
+        };
+        let entries = parse_fixture_entries(&value)?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .with_context(|| {
+                format!(
+                    "CARGO_MANIFEST_DIR is unset, so the relative paths in {FIXTURES_ENV_VAR} \
+                     cannot be resolved. Cargo sets it when it runs the target runner."
+                )
+            })?;
+        Ok(Some(Self {
+            manifest_dir,
+            entries,
+        }))
+    }
+}
+
+/// The entries must stay inside the mirror, so absolute paths and `..` are rejected. An absolute
+/// path could not be reproduced on the device anyway: its root filesystem is read-only.
+fn parse_fixture_entries(value: &OsStr) -> anyhow::Result<Vec<PathBuf>> {
+    let mut entries = Vec::new();
+    for entry in std::env::split_paths(value).filter(|path| !path.as_os_str().is_empty()) {
+        if entry.is_absolute() {
+            bail!(
+                "{FIXTURES_ENV_VAR} takes paths relative to the package root, but `{}` is \
+                 absolute. The device cannot reproduce an absolute host path.",
+                entry.display()
+            );
+        }
+        if entry
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            bail!(
+                "{FIXTURES_ENV_VAR} takes paths inside the package root, but `{}` leaves it.",
+                entry.display()
+            );
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// The path of `relative` inside the mirror. The device separates its path components with `/`,
+/// whatever the host does.
+fn device_relative_path(relative: &Path) -> anyhow::Result<String> {
+    let mut components = Vec::new();
+    for component in relative.components() {
+        let part = component
+            .as_os_str()
+            .to_str()
+            .context("Fixture paths must be utf-8")?;
+        components.push(part);
+    }
+    Ok(components.join("/"))
+}
+
+/// The content id of the whole fixture set: every relative path and the contents behind it, so
+/// that an edit or a rename lands in a directory of its own.
+fn hash_fixtures(fixtures: &Fixtures) -> anyhow::Result<String> {
+    let mut files = Vec::new();
+    for entry in &fixtures.entries {
+        collect_fixture_files(&fixtures.manifest_dir, entry, &mut files)?;
+    }
+    files.sort();
+    files.dedup();
+
+    let mut hasher = Sha256::new();
+    for relative in &files {
+        hasher.update(device_relative_path(relative)?.as_bytes());
+        hasher.update([0]);
+        hasher.update(hash_file::<Sha256>(&fixtures.manifest_dir.join(relative))?.as_bytes());
+        hasher.update([0]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn collect_fixture_files(
+    manifest_dir: &Path,
+    relative: &Path,
+    files: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    let path = manifest_dir.join(relative);
+    let metadata = std::fs::metadata(&path).with_context(|| {
+        format!(
+            "Cannot read `{}` from {FIXTURES_ENV_VAR}: {} does not exist",
+            relative.display(),
+            path.display()
+        )
+    })?;
+    if metadata.is_file() {
+        files.push(relative.to_owned());
+        return Ok(());
+    }
+    for child in std::fs::read_dir(&path)
+        .with_context(|| format!("Failed to read the fixture directory {}", path.display()))?
+    {
+        let child = child?;
+        collect_fixture_files(manifest_dir, &relative.join(child.file_name()), files)?;
+    }
+    Ok(())
+}
+
+/// Mirrors the fixtures on the device, and marks the directory complete once every entry
+/// arrived. A directory without the marker was left behind by an invocation which was killed,
+/// and is transferred again.
+fn install_fixtures(hdc: &Hdc, fixtures: &Fixtures, remote: &RemotePaths) -> anyhow::Result<()> {
+    let (fixtures_dir, marker) = remote
+        .fixtures_dir
+        .as_ref()
+        .zip(remote.fixtures_marker())
+        .expect("The fixtures have a directory on the device");
+
+    // `hdc file send` creates the directories a transferred directory needs, but not the ones a
+    // single file needs, so create every parent up front - in one command, whatever the number
+    // of entries.
+    let mut parents = BTreeSet::from([fixtures_dir.to_owned()]);
+    let mut targets = Vec::new();
+    for entry in &fixtures.entries {
+        let relative = device_relative_path(entry)?;
+        let target = format!("{fixtures_dir}/{relative}");
+        if let Some((parent, _)) = target.rsplit_once('/') {
+            parents.insert(parent.to_owned());
+        }
+        targets.push((fixtures.manifest_dir.join(entry), target));
+    }
+    let mkdir = format!(
+        "mkdir -p {}",
+        parents
+            .iter()
+            .map(|dir| shell_quote(dir))
+            .collect::<Vec<String>>()
+            .join(" ")
+    );
+    ensure_hdc_shell_success(
+        &hdc.shell(&[&mkdir])?,
+        "Failed to create the fixture directories on device",
+    )?;
+
+    for (local, target) in &targets {
+        send_file_to_device(hdc, local, target).with_context(|| {
+            format!(
+                "Failed to send the fixture {} to the device",
+                local.display()
+            )
+        })?;
+    }
+
+    ensure_hdc_shell_success(
+        &hdc.shell(&["touch", &marker])?,
+        "Failed to mark the fixtures complete on device",
+    )
+}
+
+/// What the device is still missing, having created the directories the transfers need.
+struct DeviceState {
+    has_bin: bool,
+    has_fixtures: bool,
+}
+
+fn probe_device(hdc: &Hdc, remote: &RemotePaths) -> anyhow::Result<DeviceState> {
+    let mut command = format!("mkdir -p {}", shell_quote(&remote.bin_dir));
+    if let Some(dir) = &remote.fixtures_dir {
+        command.push(' ');
+        command.push_str(&shell_quote(dir));
+    }
+    command.push_str(&format!(
+        "; [ -x {} ] && echo {HAVE_BIN_MARKER}",
+        shell_quote(&remote.bin)
+    ));
+    if let Some(marker) = remote.fixtures_marker() {
+        command.push_str(&format!(
+            "; [ -e {} ] && echo {HAVE_FIXTURES_MARKER}",
+            shell_quote(&marker)
+        ));
+    }
+    let output = hdc.shell(&[&command])?;
+    ensure_hdc_shell_success(&output, "Failed to inspect the device")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(DeviceState {
+        has_bin: has_marker(&stdout, HAVE_BIN_MARKER),
+        has_fixtures: remote.fixtures_dir.is_none() || has_marker(&stdout, HAVE_FIXTURES_MARKER),
+    })
+}
+
+/// `hdc shell` reports success even when the command it ran failed, so the answer is the output.
+fn has_marker(stdout: &str, marker: &str) -> bool {
+    stdout.lines().any(|line| line.trim() == marker)
+}
+
 /// The command which runs the test binary on the device, if the device still has it.
 ///
 /// The presence check, the `touch` which marks the build as still in use, and the test itself
@@ -423,15 +676,25 @@ fn device_file_matches(
 /// binary in between. A test which is already running survives its build directory being
 /// removed, since the device keeps the file open.
 fn run_command(remote: &RemotePaths, args: &[String], with_runtime_libraries: bool) -> String {
-    let mut run = format!(
-        "touch {} && cd {} && ",
-        shell_quote(&remote.bin_dir),
-        shell_quote(TEST_BIN_DIR)
-    );
+    let mut present = format!("[ -x {} ]", shell_quote(&remote.bin));
+    let mut touch = format!("touch {}", shell_quote(&remote.bin_dir));
+    if let (Some(dir), Some(marker)) = (&remote.fixtures_dir, remote.fixtures_marker()) {
+        present.push_str(&format!(" && [ -e {} ]", shell_quote(&marker)));
+        touch.push(' ');
+        touch.push_str(&shell_quote(dir));
+    }
+
+    let mut run = format!("{touch} && cd {} && ", shell_quote(remote.working_dir()));
     if with_runtime_libraries {
         // The binary needs libraries the device does not provide, and musl searches neither
         // the working directory nor the directory of the binary.
         run.push_str(&format!("LD_LIBRARY_PATH={} ", shell_quote(TEST_BIN_DIR)));
+    }
+    if let Some(dir) = &remote.fixtures_dir {
+        // Tests which read CARGO_MANIFEST_DIR at runtime find the mirror. The `env!` form bakes
+        // the host path into the binary and cannot be helped: the device's root filesystem is
+        // read-only, so that path can never exist there.
+        run.push_str(&format!("CARGO_MANIFEST_DIR={} ", shell_quote(dir)));
     }
     run.push_str(&shell_quote(&remote.bin));
     for arg in args {
@@ -440,9 +703,8 @@ fn run_command(remote: &RemotePaths, args: &[String], with_runtime_libraries: bo
     }
     let exit_code_file = shell_quote(&remote.exit_code_file);
     format!(
-        "if [ -x {bin} ]; then {run}; printf '%s' \"$?\" > {exit_code_file}; \
+        "if {present}; then {run}; printf '%s' \"$?\" > {exit_code_file}; \
          else mkdir -p {bin_dir}; printf '%s' {missing} > {exit_code_file}; fi",
-        bin = shell_quote(&remote.bin),
         bin_dir = shell_quote(&remote.bin_dir),
         missing = shell_quote(BIN_MISSING),
     )
@@ -512,7 +774,12 @@ fn install_bin_on_device(
     let incoming = remote.incoming_bin(pid);
     send_file_to_device(hdc, local_bin_path, &incoming)?;
 
-    let output = hdc.shell(&["chmod", "+x", &incoming])?;
+    let command = format!(
+        "chmod +x {} && touch {}",
+        shell_quote(&incoming),
+        shell_quote(&remote.build_marker())
+    );
+    let output = hdc.shell(&[&command])?;
     ensure_hdc_shell_success(&output, "Failed to mark test binary executable on device")?;
 
     verify_device_file(hdc, local_bin_path, &incoming, local_sha256)?;
@@ -544,10 +811,14 @@ fn prune_other_builds(hdc: &Hdc, bin_name: &str, remote: &RemotePaths) {
 }
 
 fn prune_other_builds_command(bin_name: &str, remote: &RemotePaths) -> String {
+    // The marker keeps the directories mirroring the files a test reads out of this: one of
+    // them could well hold a file named like the test binary.
     format!(
         "for dir in {TEST_BIN_DIR}/*/; do \
-         if [ \"$dir\" != {} ] && [ -e \"$dir\"{} ]; then rm -rf \"$dir\"; fi; done",
+         if [ \"$dir\" != {} ] && [ -e \"$dir\"{} ] && [ -e \"$dir\"{} ]; \
+         then rm -rf \"$dir\"; fi; done",
         shell_quote(&format!("{}/", remote.bin_dir)),
+        shell_quote(BUILD_MARKER),
         shell_quote(bin_name)
     )
 }
@@ -715,6 +986,13 @@ Environment variables:
         Shared libraries the binary needs but the device does not provide, separated like
         `PATH`. They are sent next to the binary and found via `LD_LIBRARY_PATH`.
         `cargo-ohos` sets this when the toolchain carries its own C++ runtime.
+    {FIXTURES_ENV_VAR}
+        Files and directories the tests read at runtime, relative to the package root and
+        separated like `PATH`. They are mirrored on the device in the same layout, and the
+        test runs with that mirror as its working directory, so relative paths resolve.
+        Tests which read `CARGO_MANIFEST_DIR` at runtime see the mirror as well; the
+        `env!(CARGO_MANIFEST_DIR)` form bakes the host path into the binary and cannot
+        be supported, since the device's root filesystem is read-only.
     {CACHE_TTL_ENV_VAR}
         How many minutes a build stays on the device after its last use ({ttl} by
         default). The invocations of one `cargo test` or `cargo nextest run` share the
@@ -779,7 +1057,9 @@ fn main() -> anyhow::Result<()> {
         .expect("utf-8");
     let pid = std::process::id();
     let local_sha256 = hash_file::<Sha256>(bin_path)?;
-    let remote = RemotePaths::new(bin_name, &local_sha256, pid);
+    let fixtures = Fixtures::from_env()?;
+    let fixtures_sha256 = fixtures.as_ref().map(hash_fixtures).transpose()?;
+    let remote = RemotePaths::new(bin_name, &local_sha256, pid, fixtures_sha256.as_deref());
     debug!("Bin_path: {:?}", bin_path);
     debug!(
         "On device: {}, exit code file: {}",
@@ -803,11 +1083,22 @@ fn main() -> anyhow::Result<()> {
         if transferred {
             bail!("The test binary disappeared from the device before it could be run");
         }
-        debug!("The device does not have {}, transferring it", remote.bin);
+        let state = probe_device(&hdc, &remote)?;
         collect_garbage(&hdc, cache_ttl_minutes());
-        install_bin_on_device(&hdc, bin_path, &remote, &local_sha256, pid)
-            .context("Failed to send binary to device")?;
-        prune_other_builds(&hdc, bin_name, &remote);
+        if !state.has_bin {
+            debug!("The device does not have {}, transferring it", remote.bin);
+            install_bin_on_device(&hdc, bin_path, &remote, &local_sha256, pid)
+                .context("Failed to send binary to device")?;
+            prune_other_builds(&hdc, bin_name, &remote);
+        }
+        if !state.has_fixtures {
+            let fixtures = fixtures
+                .as_ref()
+                .expect("Only a declared fixture set can be missing");
+            debug!("The device does not have the fixtures, transferring them");
+            install_fixtures(&hdc, fixtures, &remote)
+                .context("Failed to send the fixtures to device")?;
+        }
         transferred = true;
     };
 
@@ -821,9 +1112,10 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_device_selection, collect_garbage_command, hash_tool_missing, parse_cache_ttl,
-        parse_device_hash_output, parse_runtime_libraries, prune_other_builds_command, reports,
-        resolve_server, run_command, unknown_env_vars, Hdc, RemotePaths, BIN_MISSING,
+        check_device_selection, collect_garbage_command, has_marker, hash_fixtures,
+        hash_tool_missing, parse_cache_ttl, parse_device_hash_output, parse_fixture_entries,
+        parse_runtime_libraries, prune_other_builds_command, reports, resolve_server, run_command,
+        unknown_env_vars, Fixtures, Hdc, RemotePaths, BIN_MISSING, BUILD_MARKER,
         DEFAULT_CACHE_TTL_MINUTES, HDC_SERVER_REJECTED, HDC_SERVER_UNREACHABLE, TEST_BIN_DIR,
     };
     use std::ffi::{OsStr, OsString};
@@ -983,9 +1275,9 @@ mod tests {
 
     #[test]
     fn remote_paths_are_shared_per_build_and_private_per_process() {
-        let first = RemotePaths::new("crate-tests", HASH_A, 11);
-        let second = RemotePaths::new("crate-tests", HASH_A, 12);
-        let other_build = RemotePaths::new("crate-tests", HASH_B, 11);
+        let first = RemotePaths::new("crate-tests", HASH_A, 11, None);
+        let second = RemotePaths::new("crate-tests", HASH_A, 12, None);
+        let other_build = RemotePaths::new("crate-tests", HASH_B, 11, None);
 
         // Two invocations of the same build reuse the transferred binary ...
         assert_eq!(first.bin, second.bin);
@@ -1004,7 +1296,7 @@ mod tests {
 
     #[test]
     fn the_run_command_checks_for_the_binary_and_runs_it_in_one_go() {
-        let remote = RemotePaths::new("crate-tests", HASH_A, 11);
+        let remote = RemotePaths::new("crate-tests", HASH_A, 11, None);
         let command = run_command(&remote, &["--exact".to_owned(), "a::b".to_owned()], false);
 
         // Nothing may collect the binary between the check and the run, ...
@@ -1023,14 +1315,18 @@ mod tests {
             "{command}"
         );
         // A miss is reported through the exit code file, so that the output of the test itself
-        // stays untouched.
+        // stays untouched - which means the shared directory has to exist by then.
+        assert!(
+            command.contains(&format!("mkdir -p '{}'", remote.bin_dir)),
+            "{command}"
+        );
         assert!(command.contains(&format!("'{BIN_MISSING}'")), "{command}");
         assert!(!command.contains("LD_LIBRARY_PATH"), "{command}");
     }
 
     #[test]
     fn the_run_command_sets_ld_library_path_for_runtime_libraries() {
-        let remote = RemotePaths::new("crate-tests", HASH_A, 11);
+        let remote = RemotePaths::new("crate-tests", HASH_A, 11, None);
         let command = run_command(&remote, &[], true);
 
         assert!(
@@ -1071,11 +1367,120 @@ mod tests {
     }
 
     #[test]
+    fn fixture_entries_must_stay_inside_the_package() {
+        assert_eq!(
+            parse_fixture_entries(&std::env::join_paths(["tests/data", "fixture.json"]).unwrap())
+                .unwrap(),
+            [PathBuf::from("tests/data"), PathBuf::from("fixture.json")]
+        );
+        // The device's root filesystem is read-only, so an absolute host path is hopeless, and
+        // a path leaving the package root has nowhere to land in the mirror.
+        assert!(parse_fixture_entries(OsStr::new("/etc/hosts")).is_err());
+        assert!(parse_fixture_entries(OsStr::new("../sibling/data")).is_err());
+    }
+
+    #[test]
+    fn the_fixture_hash_ignores_the_order_of_the_entries() {
+        let project = unit_fixture_project("order", &[("a/one.txt", "1"), ("b/two.txt", "2")]);
+        let hash_of = |entries: Vec<PathBuf>| {
+            hash_fixtures(&Fixtures {
+                manifest_dir: project.clone(),
+                entries,
+            })
+            .unwrap()
+        };
+
+        assert_eq!(
+            hash_of(vec![PathBuf::from("a"), PathBuf::from("b")]),
+            hash_of(vec![PathBuf::from("b"), PathBuf::from("a")])
+        );
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn the_fixture_hash_follows_the_contents_and_the_names() {
+        let base = unit_fixture_project("contents", &[("data/one.txt", "1")]);
+        let edited = unit_fixture_project("edited", &[("data/one.txt", "2")]);
+        let renamed = unit_fixture_project("renamed", &[("data/uno.txt", "1")]);
+        let hash_of = |dir: &PathBuf| {
+            hash_fixtures(&Fixtures {
+                manifest_dir: dir.clone(),
+                entries: vec![PathBuf::from("data")],
+            })
+            .unwrap()
+        };
+
+        assert_ne!(hash_of(&base), hash_of(&edited), "an edit must be noticed");
+        assert_ne!(
+            hash_of(&base),
+            hash_of(&renamed),
+            "a rename must be noticed"
+        );
+
+        for dir in [base, edited, renamed] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn the_run_command_uses_the_fixtures_as_the_working_directory() {
+        let remote = RemotePaths::new("crate-tests", HASH_A, 11, Some(HASH_B));
+        let fixtures_dir = remote.fixtures_dir.clone().expect("declared");
+        let command = run_command(&remote, &[], false);
+
+        // The test only runs once the whole fixture set arrived, ...
+        assert!(
+            command.contains(&format!("[ -e '{fixtures_dir}/.ready' ]")),
+            "{command}"
+        );
+        // ... its relative paths resolve against the mirror, ...
+        assert!(
+            command.contains(&format!("cd '{fixtures_dir}'")),
+            "{command}"
+        );
+        assert!(
+            command.contains(&format!("CARGO_MANIFEST_DIR='{fixtures_dir}'")),
+            "{command}"
+        );
+        // ... and both directories count as in use.
+        assert!(
+            command.contains(&format!("touch '{}' '{fixtures_dir}'", remote.bin_dir)),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn detects_a_probe_marker() {
+        // hdc terminates the lines of a shell command with CRLF.
+        assert!(has_marker("[Fail]a notice\r\nMARK\r\n", "MARK"));
+        assert!(!has_marker("", "MARK"));
+        assert!(!has_marker("sh: echo MARK: not found\r\n", "MARK"));
+    }
+
+    /// A package root holding `files`, given as (path relative to it, contents).
+    fn unit_fixture_project(name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ohos-test-runner-unit-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, contents) in files {
+            let file = dir.join(path);
+            std::fs::create_dir_all(file.parent().expect("a fixture file has a parent")).unwrap();
+            std::fs::write(file, contents).unwrap();
+        }
+        dir
+    }
+
+    #[test]
     fn pruning_quotes_the_binary_name_and_keeps_the_current_build() {
-        let remote = RemotePaths::new("odd name'; rm -rf /", HASH_A, 11);
+        let remote = RemotePaths::new("odd name'; rm -rf /", HASH_A, 11, None);
         let command = prune_other_builds_command("odd name'; rm -rf /", &remote);
 
         assert!(command.contains(r"'odd name'\''; rm -rf /'"), "{command}");
+        // A directory mirroring the files a test reads could hold a file named like the test
+        // binary, so a build is recognized by its marker as well.
+        assert!(command.contains(&format!("'{BUILD_MARKER}'")), "{command}");
         assert!(
             command.contains(&format!("!= '{}/'", remote.bin_dir)),
             "{command}"

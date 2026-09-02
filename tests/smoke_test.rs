@@ -285,6 +285,8 @@ const STALE_BUILD_DIR: &str = "aaaaaaaaaaaaaaaa";
 const FRESH_BUILD_DIR: &str = "bbbbbbbbbbbbbbbb";
 /// A pid no invocation can have, so the other smoke tests never own this file.
 const STALE_EXIT_CODE_FILE: &str = "exit_code-4294967295";
+const FIXTURE_READING_CASE: &str = "reads_the_files_it_declared";
+const FIXTURE_CONTENTS: &str = "hello from the package";
 const PARALLEL_TEST_COUNT: usize = 16;
 /// Enough padding for the transfer of the fixture to take long enough to overlap the invocations
 /// which follow it. The runner before per-invocation exit code files fails this test reliably at
@@ -424,6 +426,80 @@ fn unused_builds_are_collected() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A test may read files from its package, if it declares them.
+#[test]
+#[ignore = "requires an OpenHarmony target toolchain, linker setup, hdc, and a connected device"]
+fn declared_fixtures_are_readable_from_the_test() -> Result<(), Box<dyn std::error::Error>> {
+    let project = TempProject::new()?;
+    let fixture_file = write_fixture_reading_project(project.path())?;
+
+    // Without the declaration the runner has no way to know about the file, and the test fails
+    // on the device exactly as the README describes.
+    let undeclared = run_fixture_test_case(project.path(), FIXTURE_READING_CASE)?;
+    assert!(
+        !undeclared.status.success(),
+        "the test read a file which was never sent to the device\nstdout:\n{}",
+        String::from_utf8_lossy(&undeclared.stdout)
+    );
+
+    let run = run_fixture_test_case_with_env(
+        project.path(),
+        FIXTURE_READING_CASE,
+        &[("OHOS_TEST_RUNNER_FIXTURES", "tests/data")],
+    )?;
+    assert!(
+        run.status.success(),
+        "the test could not read the files it declared\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // The mirror is a directory of its own, next to the build directories.
+    let mirrors = device_dirs_holding(&fixture_file)?;
+    assert_eq!(
+        mirrors.len(),
+        1,
+        "expected one mirror of the package files, found: {mirrors:?}"
+    );
+
+    for dir in mirrors {
+        let _ = hdc_shell(&["rm", "-rf", &format!("{TEST_BIN_DIR}/{dir}")]);
+    }
+    Ok(())
+}
+
+/// Writes a package whose test reads a file from the package, and returns that file's path
+/// relative to the package root.
+fn write_fixture_reading_project(project_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    fs::create_dir_all(project_dir.join("tests/data"))?;
+    let name = project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("failed to derive a name from the temp project directory")?;
+    let data_file = format!("tests/data/{name}.txt");
+    fs::write(
+        project_dir.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    )?;
+    fs::write(project_dir.join(&data_file), FIXTURE_CONTENTS)?;
+    fs::write(
+        project_dir.join("tests").join(format!("{name}_fixture.rs")),
+        format!(
+            "#[test]\nfn {FIXTURE_READING_CASE}() {{\n    \
+             let relative = std::fs::read_to_string(\"{data_file}\")\n        \
+             .expect(\"a relative path resolves against the package root\");\n    \
+             assert_eq!(relative.trim(), \"{FIXTURE_CONTENTS}\");\n    \
+             let manifest_dir = std::env::var(\"CARGO_MANIFEST_DIR\")\n        \
+             .expect(\"CARGO_MANIFEST_DIR is set at runtime\");\n    \
+             let absolute = std::fs::read_to_string(\n        \
+             std::path::Path::new(&manifest_dir).join(\"{data_file}\"),\n    )\n    \
+             .expect(\"CARGO_MANIFEST_DIR points at the package root\");\n    \
+             assert_eq!(absolute.trim(), \"{FIXTURE_CONTENTS}\");\n}}\n"
+        ),
+    )?;
+    Ok(data_file)
+}
+
 fn cargo_nextest_available() -> bool {
     Command::new("cargo")
         .args(["nextest", "--version"])
@@ -513,7 +589,12 @@ fn build_dirs_of(test_target: &str) -> Result<Vec<String>, Box<dyn std::error::E
 
 /// The directories under [`TEST_BIN_DIR`] holding a binary whose name starts with `bin_prefix`.
 fn build_dirs_starting_with(bin_prefix: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let stdout = hdc_shell(&["ls", "-1", &format!("{TEST_BIN_DIR}/*/{bin_prefix}*")])?;
+    device_dirs_holding(&format!("{bin_prefix}*"))
+}
+
+/// The directories under [`TEST_BIN_DIR`] which hold `relative`, a path inside one of them.
+fn device_dirs_holding(relative: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let stdout = hdc_shell(&["ls", "-1", &format!("{TEST_BIN_DIR}/*/{relative}")])?;
     let prefix = format!("{TEST_BIN_DIR}/");
     let mut dirs = stdout
         .lines()
