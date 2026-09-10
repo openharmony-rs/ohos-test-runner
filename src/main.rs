@@ -165,12 +165,15 @@ impl Hdc {
 
     fn silent_server_error(&self) -> String {
         match &self.server {
-            None => "The hdc server closed the connection without answering.".to_owned(),
+            None => "The hdc server closed the connection without answering. Check that it is \
+                     the same hdc version as this client, with `hdc checkserver`."
+                .to_owned(),
             Some(server) => format!(
                 "The hdc server at {server}, selected via {HDC_SERVER_ENV_VAR}, closed the \
-                 connection without answering. Something accepts connections there, but it is \
-                 not an hdc server. With an SSH tunnel, check that the hdc server is running on \
-                 the machine the tunnel leads to, and that the tunnel ends at its port."
+                 connection without answering. Either it is a different hdc version than this \
+                 client - `hdc -s {server} checkserver` shows both - or what accepts connections \
+                 there is not an hdc server: with an SSH tunnel, check that the hdc server is \
+                 running on the machine with the device, and that the tunnel forwards to its port."
             ),
         }
     }
