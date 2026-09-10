@@ -25,6 +25,10 @@ use std::process::{Command, Output, Stdio};
 
 const TEST_BIN_DIR: &str = "/data/local/tmp/ohos-test-runner";
 
+/// Printed to stderr by the hdc client when it cannot reach the hdc server. hdc exits with
+/// status 0 all the same, so the failure is only visible in its output.
+const HDC_SERVER_UNREACHABLE: &str = "Connect server failed";
+
 /// Environment variable to select the device (hdc connect-key) to run the binary on.
 const HDC_TARGET_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_TARGET";
 
@@ -70,16 +74,34 @@ impl Hdc {
     }
 
     fn shell(&self, args: &[&str]) -> anyhow::Result<Output> {
-        self.command()
-            .arg("shell")
-            .args(args)
+        self.output(self.command().arg("shell").args(args))
+    }
+
+    /// Runs the hdc `command` to completion and captures its output, failing if hdc could not
+    /// reach its server.
+    fn output(&self, command: &mut Command) -> anyhow::Result<Output> {
+        let output = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("Failed to spawn hdc shell")?
+            .context("Failed to spawn hdc")?
             .wait_with_output()
-            .context("Failed to wait for hdc shell")
+            .context("Failed to wait for hdc")?;
+        if reports_unreachable_server(&output.stdout) || reports_unreachable_server(&output.stderr)
+        {
+            bail!(
+                "hdc cannot reach the hdc server (`{HDC_SERVER_UNREACHABLE}`). Check that the \
+                 server is running, e.g. with `hdc list targets`."
+            );
+        }
+        Ok(output)
     }
+}
+
+fn reports_unreachable_server(output: &[u8]) -> bool {
+    String::from_utf8_lossy(output)
+        .lines()
+        .any(|line| line.trim() == HDC_SERVER_UNREACHABLE)
 }
 
 fn hash_file<D: Digest>(local_bin_path: &Path) -> anyhow::Result<String> {
@@ -238,18 +260,15 @@ fn send_file_to_device(
     let output = hdc.shell(&["mkdir", "-p", TEST_BIN_DIR])?;
     ensure_hdc_shell_success(&output, "Failed to create test directory on device")?;
 
-    let mut hdc_cmd = hdc.command();
-    hdc_cmd
-        .args(["file", "send"])
-        .arg(local_bin_path)
-        .arg(TEST_BIN_DIR);
-    let res = hdc_cmd
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("Failed to run hdc")
-        .wait_with_output()
-        .expect("Failed to get output of hdc");
+    let res = hdc.output(
+        hdc.command()
+            .args(["file", "send"])
+            .arg(local_bin_path)
+            .arg(TEST_BIN_DIR),
+    )?;
     assert!(res.status.success());
+    // Captured to recognize an unreachable server, but meant for the user.
+    eprint!("{}", String::from_utf8_lossy(&res.stderr));
     if !res.stdout.starts_with(b"FileTransfer finish") {
         // Don't bail for now, we still verify the file hash below anyway.
         log::warn!("Unexpected output from hdc. File transfer may have failed.");
@@ -419,14 +438,7 @@ fn main() -> anyhow::Result<()> {
     let on_device_bin_path = format!("{TEST_BIN_DIR}/{}", bin_name.to_str().expect("utf-8"));
     debug!("Bin_path: {:?}", bin_path);
 
-    let targets = Command::new("hdc")
-        .args(["list", "targets"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn `hdc list targets`")?
-        .wait_with_output()
-        .context("Failed to wait for `hdc list targets`")?;
+    let targets = hdc.output(Command::new("hdc").args(["list", "targets"]))?;
     ensure_hdc_shell_success(&targets, "Failed to list HDC targets")?;
     let targets_stdout = String::from_utf8_lossy(&targets.stdout);
     check_device_selection(&targets_stdout, hdc.target.as_deref())?;
@@ -473,16 +485,7 @@ fn main() -> anyhow::Result<()> {
         bail!("Non zero exit code from hdc: {res}");
     }
 
-    let mut hdc_cmd = hdc.command();
-    let res = hdc_cmd
-        .arg("shell")
-        .arg("cat")
-        .arg(exit_code_file)
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn hdc shell")?
-        .wait_with_output()
-        .context("Failed to wait for hdc shell")?;
+    let res = hdc.shell(&["cat", &exit_code_file])?;
     if !res.status.success() {
         bail!("Non zero exit code from hdc: {res:?}");
     }
@@ -498,7 +501,7 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::{
         check_device_selection, hash_tool_missing, parse_device_hash_output,
-        parse_runtime_libraries, unknown_env_vars,
+        parse_runtime_libraries, reports_unreachable_server, unknown_env_vars,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -580,6 +583,14 @@ mod tests {
     fn rejects_empty_target_list() {
         assert!(check_device_selection("[Empty]\n", Some("127.0.0.1:5555")).is_err());
         assert!(check_device_selection("", None).is_err());
+    }
+
+    #[test]
+    fn detects_an_unreachable_server() {
+        assert!(reports_unreachable_server(b"Connect server failed\n"));
+        assert!(reports_unreachable_server(b"Connect server failed\r\n"));
+        assert!(!reports_unreachable_server(b""));
+        assert!(!reports_unreachable_server(b"127.0.0.1:5555\n"));
     }
 
     #[test]
