@@ -68,6 +68,9 @@ cargo test --target aarch64-unknown-linux-ohos
 The runner sends everything the test needs from the machine it runs on, so the two machines
 share no files. Unlike `hdc -s`, the variable accepts host names.
 
+[docs/remote-device.md](docs/remote-device.md) describes how to set up the server and connect to
+it, directly or through an SSH tunnel.
+
 Environment variables starting with `OHOS_TEST_RUNNER` which are not known to the installed version
 are reported with a warning, since they are likely typos, or configuration for a newer version of
 this tool. Run `ohos-test-runner --help` for the list of supported variables.
