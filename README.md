@@ -54,6 +54,20 @@ cargo test --target aarch64-unknown-linux-ohos
 
 With a single attached device the variable is optional and can be left unset.
 
+### Using a device attached to another machine
+
+The device does not have to be attached to the machine running `cargo test`. hdc runs a server
+on the machine the device is attached to, and `OHOS_TEST_RUNNER_HDC_SERVER` points the runner at
+it, like `hdc -s` does:
+
+```
+export OHOS_TEST_RUNNER_HDC_SERVER=device-host:8710
+cargo test --target aarch64-unknown-linux-ohos
+```
+
+The runner sends everything the test needs from the machine it runs on, so the two machines
+share no files. Unlike `hdc -s`, the variable accepts host names.
+
 Environment variables starting with `OHOS_TEST_RUNNER` which are not known to the installed version
 are reported with a warning, since they are likely typos, or configuration for a newer version of
 this tool. Run `ohos-test-runner --help` for the list of supported variables.
