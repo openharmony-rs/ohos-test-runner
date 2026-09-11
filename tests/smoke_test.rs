@@ -770,6 +770,197 @@ fn a_stale_build_directory_is_filled_again() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// Runs needing different versions of a runtime library each find their own, instead of whichever
+/// version was sent last.
+#[test]
+#[ignore = "requires an OpenHarmony target toolchain, linker setup, hdc, and a connected device"]
+fn runtime_libraries_of_different_versions_stay_apart() -> Result<(), Box<dyn std::error::Error>> {
+    let project = TempProject::new()?;
+    let library = project.path().join("libdummy.so");
+    let libraries = library.to_str().ok_or("path is not utf-8")?.to_owned();
+    let mut dirs = Vec::new();
+
+    for version in ["version one", "version two"] {
+        fs::write(&library, version)?;
+        write_library_reading_project(project.path(), version)?;
+        let run = run_fixture_test_case_with_env(
+            project.path(),
+            LIBRARY_READING_CASE,
+            &[
+                ("OHOS_TEST_RUNNER_RUNTIME_LIBRARIES", &libraries),
+                KEEP_BUILDS,
+            ],
+        )?;
+        assert!(
+            run.status.success(),
+            "the test did not find its library\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        dirs = device_dirs_holding("libdummy.so")?;
+    }
+    // The first version is still where the first run found it.
+    assert_eq!(dirs.len(), 2, "expected a directory per version: {dirs:?}");
+    let contents = dirs
+        .iter()
+        .map(|dir| hdc_shell(&["cat", &format!("{TEST_BIN_DIR}/{dir}/libdummy.so")]))
+        .collect::<Result<Vec<String>, _>>()?;
+    assert!(
+        contents
+            .iter()
+            .any(|contents| contents.trim() == "version one"),
+        "the first version was replaced: {contents:?}"
+    );
+
+    for dir in dirs {
+        remove_device_dir(&dir);
+    }
+    Ok(())
+}
+
+const LIBRARY_READING_CASE: &str = "reads_its_library";
+
+/// A package whose test checks that `LD_LIBRARY_PATH` holds the library with `contents`.
+fn write_library_reading_project(
+    project_dir: &Path,
+    contents: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(project_dir.join("tests"))?;
+    let name = project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("failed to derive a name from the temp project directory")?;
+    fs::write(
+        project_dir.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    )?;
+    fs::write(
+        project_dir.join("tests").join(format!("{name}_fixture.rs")),
+        format!(
+            "#[test]\nfn {LIBRARY_READING_CASE}() {{\n    \
+             let dir = std::env::var(\"LD_LIBRARY_PATH\").unwrap();\n    \
+             let library = std::fs::read_to_string(format!(\"{{dir}}/libdummy.so\")).unwrap();\n    \
+             assert_eq!(library.trim(), \"{contents}\");\n}}\n"
+        ),
+    )?;
+    Ok(())
+}
+
+/// A run keeping its builds still owns them while it lasts: a test which outlasts the window of
+/// the collection of unused builds keeps its files.
+#[test]
+#[ignore = "requires an OpenHarmony target toolchain, linker setup, hdc, and a connected device"]
+fn a_run_keeping_its_builds_keeps_them_while_it_lasts() -> Result<(), Box<dyn std::error::Error>> {
+    let kept = TempProject::new()?;
+    let fixture_file = write_fixture_reading_project(kept.path())?;
+    // The test reads its file late, after the builds have been collected if they were not
+    // protected.
+    let test_file = kept.path().join("tests").join(format!(
+        "{}_fixture.rs",
+        kept.path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("name")?
+    ));
+    let source = fs::read_to_string(&test_file)?;
+    fs::write(
+        &test_file,
+        source.replacen(
+            &format!("fn {FIXTURE_READING_CASE}() {{\n"),
+            &format!(
+                "fn {FIXTURE_READING_CASE}() {{\n    \
+                 std::thread::sleep(std::time::Duration::from_secs(15));\n"
+            ),
+            1,
+        ),
+    )?;
+    let kept_prefix = kept.device_bin_prefix().ok_or("no binary name")?;
+    let mut run = fixture_test_command(
+        kept.path(),
+        FIXTURE_READING_CASE,
+        &[("OHOS_TEST_RUNNER_FIXTURES", "tests/data"), KEEP_BUILDS],
+    )?
+    .spawn()?;
+
+    let waited = wait_until("the kept run starts its test", BUILD_TIMEOUT, || {
+        Ok(!installed_binaries_starting_with(&kept_prefix)?.is_empty()
+            && !device_dirs_holding(&fixture_file)?.is_empty())
+    });
+    if let Err(err) = waited {
+        let _ = run.kill();
+        return Err(err);
+    }
+    // As if the test had been running for longer than the collection allows.
+    let mut aged = build_dirs_starting_with(&kept_prefix)?;
+    aged.extend(device_dirs_holding(&fixture_file)?);
+    for dir in &aged {
+        hdc_shell(&[&format!(
+            "touch -d '2020-01-01 00:00:00' {TEST_BIN_DIR}/{dir}"
+        )])?;
+    }
+
+    // Another run transfers a build of its own, which collects unused builds on the way.
+    let other = TempProject::new()?;
+    write_smoke_test_fixture(other.path())?;
+    let collecting = run_fixture_test_case_with_env(
+        other.path(),
+        FIXTURE_PASSING_CASE,
+        &[("OHOS_TEST_RUNNER_CACHE_TTL_MINUTES", "1")],
+    )?;
+    assert!(collecting.status.success(), "the collecting run failed");
+
+    let status = run.wait()?;
+    for dir in &aged {
+        remove_device_dir(dir);
+    }
+    assert!(
+        status.success(),
+        "the kept run lost its files while it lasted"
+    );
+    Ok(())
+}
+
+/// Empty directories are part of the package files: hdc cannot send them, so they are created.
+#[test]
+#[ignore = "requires an OpenHarmony target toolchain, linker setup, hdc, and a connected device"]
+fn empty_fixture_directories_are_mirrored() -> Result<(), Box<dyn std::error::Error>> {
+    let project = TempProject::new()?;
+    let fixture_file = write_fixture_reading_project(project.path())?;
+    fs::create_dir_all(project.path().join("tests/data/empty/deeper"))?;
+    fs::create_dir_all(project.path().join("tests/out"))?;
+    let name = project
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("name")?
+        .to_owned();
+    fs::write(
+        project
+            .path()
+            .join("tests")
+            .join(format!("{name}_fixture.rs")),
+        format!(
+            "#[test]\nfn {FIXTURE_READING_CASE}() {{\n    \
+             assert!(std::path::Path::new(\"{fixture_file}\").is_file());\n    \
+             assert!(std::path::Path::new(\"tests/data/empty/deeper\").is_dir());\n    \
+             assert!(std::path::Path::new(\"tests/out\").is_dir());\n}}\n"
+        ),
+    )?;
+
+    let run = run_fixture_test_case_with_env(
+        project.path(),
+        FIXTURE_READING_CASE,
+        &[("OHOS_TEST_RUNNER_FIXTURES", "tests/data:tests/out")],
+    )?;
+    assert!(
+        run.status.success(),
+        "the test did not find the empty directories\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    Ok(())
+}
+
 /// Waits for `done` to hold, looking again every 200 ms.
 fn wait_until(
     what: &str,
@@ -938,12 +1129,15 @@ fn installed_binaries_starting_with(
 }
 
 /// The directories under [`TEST_BIN_DIR`] which hold `relative`, a path inside one of them.
+///
+/// Directories on their way into place, named `<id>.<invocation>.incoming`, do not count.
 fn device_dirs_holding(relative: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let stdout = hdc_shell(&["ls", "-1", &format!("{TEST_BIN_DIR}/*/{relative}")])?;
     let prefix = format!("{TEST_BIN_DIR}/");
     let mut dirs = stdout
         .lines()
         .filter_map(|line| line.trim().strip_prefix(&prefix)?.split('/').next())
+        .filter(|dir| !dir.contains('.'))
         .map(str::to_owned)
         .collect::<Vec<String>>();
     dirs.sort();

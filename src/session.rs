@@ -23,9 +23,11 @@ pub(crate) const SESSIONS_DIR: &str = ".sessions";
 /// run, the id of the session, and the name of its session file.
 pub(crate) const WATCH_FLAG: &str = "--cleanup-after";
 
-/// The session of the runs which keep their builds, and of the runs which could not start a
-/// session of their own. No watcher removes its markers, and the collection of unused builds
-/// ignores them, so they only keep the directories from being removed by the end of another run.
+/// The markers of the runs which keep their builds, and of the runs which could not start a
+/// session of their own. No watcher removes them, and the collection of unused builds ignores
+/// them, so they only keep the directories from being removed by the end of another run. A run
+/// keeping its builds marks them with its own session as well, which protects them from the
+/// collection until the run ends.
 const KEEP_SESSION: &str = "keep";
 
 /// How long a marker keeps a directory from being collected as unused. A marker older than this
@@ -37,28 +39,49 @@ const SESSION_ID_LEN: usize = 16;
 /// The session of the run this invocation belongs to.
 pub(crate) struct Session {
     id: String,
+    /// Whether the run keeps its builds on the device after it ends.
+    keep: bool,
 }
 
 impl Session {
+    /// A session without a watcher, which leaves the builds to the collection of unused builds.
     pub(crate) fn keep() -> Self {
         Self {
             id: KEEP_SESSION.to_owned(),
+            keep: true,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_id(id: &str) -> Self {
-        Self { id: id.to_owned() }
+    pub(crate) fn with_id(id: &str, keep: bool) -> Self {
+        Self {
+            id: id.to_owned(),
+            keep,
+        }
     }
 
     /// The shell command which marks the directories `names` in [`TEST_BIN_DIR`] as used by this
     /// session. The directories need not exist yet.
     pub(crate) fn mark_command(&self, names: &[&str]) -> String {
-        let dir = format!("{TEST_BIN_DIR}/{SESSIONS_DIR}/{}", self.id);
-        let mut command = format!("mkdir -p {} && touch", shell_quote(&dir));
-        for name in names {
+        let mut sessions = vec![self.id.as_str()];
+        if self.keep && self.id != KEEP_SESSION {
+            sessions.push(KEEP_SESSION);
+        }
+        let dirs = sessions
+            .iter()
+            .map(|id| format!("{TEST_BIN_DIR}/{SESSIONS_DIR}/{id}"))
+            .collect::<Vec<String>>();
+        let mut command = "mkdir -p".to_owned();
+        for dir in &dirs {
             command.push(' ');
-            command.push_str(&shell_quote(&format!("{dir}/{name}")));
+            command.push_str(&shell_quote(dir));
+        }
+        command.push_str(" && touch");
+        for dir in &dirs {
+            for name in names {
+                command.push(' ');
+                command.push_str(&shell_quote(&format!("{dir}/{name}")));
+            }
         }
         command
     }
@@ -72,16 +95,18 @@ pub(crate) fn marked_by_a_run() -> String {
 }
 
 /// Joins the session of the run which invoked this runner, starting it and its watcher if this is
-/// the first invocation of the run.
+/// the first invocation of the run. With `keep`, the watcher leaves the builds of the run to the
+/// collection of unused builds.
 ///
-/// Where no session can be started, the builds are marked as kept instead, which leaves them to
-/// the collection of unused builds.
-pub(crate) fn join() -> Session {
+/// Where no session can be started, the builds are marked as kept instead.
+pub(crate) fn join(keep: bool) -> Session {
     #[cfg(unix)]
     match unix::join() {
-        Ok(session) => return session,
+        Ok(id) => return Session { id, keep },
         Err(err) => log::warn!("The builds of this run stay on the device after it: {err:#}"),
     }
+    #[cfg(not(unix))]
+    let _ = keep;
     Session::keep()
 }
 
@@ -202,7 +227,7 @@ fn parse_proc_stat(stat: &str) -> Option<ProcStat> {
 
 #[cfg(unix)]
 mod unix {
-    use super::{is_session_id, Session, WATCH_FLAG};
+    use super::{is_session_id, WATCH_FLAG};
     use crate::random_id;
     use anyhow::{bail, Context};
     use std::fs::{File, OpenOptions};
@@ -223,7 +248,7 @@ mod unix {
     /// The session of a run is recorded in a file named after the run. The watcher holds a lock on
     /// it for as long as it lives, so a file nobody holds a lock on belongs to a run which has not
     /// started its watcher yet, or whose watcher is gone.
-    pub(super) fn join() -> anyhow::Result<Session> {
+    pub(super) fn join() -> anyhow::Result<String> {
         let owner = find_owner();
         let path = lock_dir()?.join(&owner.key);
         let mut file = OpenOptions::new()
@@ -243,7 +268,7 @@ mod unix {
             spawn_watcher(owner.pid, &id, &owner.key, file.try_clone()?)?;
             file.write_all(id.as_bytes())?;
             log::debug!("Started the session {id} of the run {}", owner.pid);
-            return Ok(Session { id });
+            return Ok(id);
         }
 
         let deadline = Instant::now() + SESSION_ID_TIMEOUT;
@@ -251,7 +276,7 @@ mod unix {
             let id = std::fs::read_to_string(&path)?;
             if is_session_id(&id) {
                 log::debug!("Joined the session {id} of the run {}", owner.pid);
-                return Ok(Session { id });
+                return Ok(id);
             }
             if Instant::now() >= deadline {
                 bail!("{} holds no session id", path.display());
@@ -514,13 +539,36 @@ mod tests {
 
     #[test]
     fn marks_directories_for_the_session() {
-        let command = Session::with_id("0123456789abcdef").mark_command(&["fedcba9876543210"]);
+        let command =
+            Session::with_id("0123456789abcdef", false).mark_command(&["fedcba9876543210"]);
         assert_eq!(
             command,
             format!(
                 "mkdir -p '{TEST_BIN_DIR}/{SESSIONS_DIR}/0123456789abcdef' && \
                  touch '{TEST_BIN_DIR}/{SESSIONS_DIR}/0123456789abcdef/fedcba9876543210'"
             )
+        );
+    }
+
+    #[test]
+    fn a_run_keeping_its_builds_protects_them_until_it_ends() {
+        // The session marker keeps the collection away during the run, and the keep marker
+        // keeps the end of the run - and of other runs - from removing them.
+        let command =
+            Session::with_id("0123456789abcdef", true).mark_command(&["fedcba9876543210"]);
+        for session in ["0123456789abcdef", "keep"] {
+            assert!(
+                command.contains(&format!(
+                    "'{TEST_BIN_DIR}/{SESSIONS_DIR}/{session}/fedcba9876543210'"
+                )),
+                "{command}"
+            );
+        }
+        let fallback = Session::keep().mark_command(&["fedcba9876543210"]);
+        assert_eq!(
+            fallback.matches("fedcba9876543210").count(),
+            1,
+            "{fallback}"
         );
     }
 

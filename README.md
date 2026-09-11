@@ -34,7 +34,7 @@ for OpenHarmony.
 Tests run on-device and `ohos-test-runner` cannot know which files a test opens.
 If your test or benchmark needs files, declare them in `OHOS_TEST_RUNNER_FIXTURES`. 
 Paths should be relative to the package root and separated like `PATH`.
-Both files and directories are supported.
+Both files and directories (including empty ones) are supported, but not the package root itself.
 
 ```
 export OHOS_TEST_RUNNER_FIXTURES=tests/data:benches/corpus

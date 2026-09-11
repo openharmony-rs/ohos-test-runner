@@ -263,6 +263,24 @@ fn the_watcher_cleans_up_when_the_run_ends() {
     );
 }
 
+/// The package root would bring the build output along, and cannot be mirrored into itself.
+#[cfg(unix)]
+#[test]
+fn rejects_the_package_root_as_fixture_before_calling_hdc() {
+    let hdc = FakeHdc::new("package-root", UNREACHABLE);
+    let output = hdc
+        .runner()
+        .arg(env!("CARGO_BIN_EXE_ohos-test-runner"))
+        .env("OHOS_TEST_RUNNER_FIXTURES", ".")
+        .env("CARGO_MANIFEST_DIR", env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run ohos-test-runner");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("package root itself"), "stderr: {stderr}");
+    assert_eq!(hdc.invocations(), "");
+}
+
 #[test]
 fn the_watcher_rejects_a_malformed_session_id() {
     let output = Command::new(env!("CARGO_BIN_EXE_ohos-test-runner"))
