@@ -137,6 +137,16 @@ impl Hdc {
         Ok(Self { server, target })
     }
 
+    /// Names the device in the file names of the host, whatever characters the server address
+    /// and connect-key contain.
+    fn device_key(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.server.as_deref().unwrap_or_default());
+        hasher.update([0]);
+        hasher.update(self.target.as_deref().unwrap_or_default());
+        content_id(&hex::encode(hasher.finalize())).to_owned()
+    }
+
     /// An hdc command addressing the server, but no particular device.
     fn server_command(&self) -> Command {
         let mut command = Command::new("hdc");
@@ -1317,6 +1327,9 @@ fn main() -> anyhow::Result<()> {
         if transferred {
             bail!("The test binary disappeared from the device before it could be run");
         }
+        // Another invocation on this host may be transferring the same files right now: wait for
+        // it, and find them on the device.
+        let _transfers = session::lock_transfers(&hdc.device_key(), &remote.dir_names());
         let state = probe_device(&hdc, &remote, &session, cache_ttl_minutes())?;
         if !state.has_bin {
             debug!("The device does not have {}, transferring it", remote.bin);
@@ -1489,6 +1502,26 @@ mod tests {
             target: None,
         };
         assert_eq!(local.command().get_args().count(), 0);
+    }
+
+    #[test]
+    fn the_device_key_names_the_server_and_the_device() {
+        let hdc = |server: Option<&str>, target: Option<&str>| Hdc {
+            server: server.map(str::to_owned),
+            target: target.map(str::to_owned),
+        };
+        let local = hdc(None, Some("127.0.0.1:5555")).device_key();
+        assert_eq!(local.len(), 16);
+        assert!(
+            local.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{local}"
+        );
+        assert_eq!(local, hdc(None, Some("127.0.0.1:5555")).device_key());
+        assert_ne!(local, hdc(None, Some("127.0.0.1:5556")).device_key());
+        assert_ne!(
+            local,
+            hdc(Some("10.0.0.2:8710"), Some("127.0.0.1:5555")).device_key()
+        );
     }
 
     #[test]

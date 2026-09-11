@@ -138,6 +138,38 @@ pub(crate) fn cleanup_command(id: &str) -> String {
     )
 }
 
+/// Held while this invocation transfers a directory to the device, so that the other invocations
+/// on this host wait for the transfer rather than send the same files side by side - like the two
+/// listing invocations nextest starts for every test binary at the same moment. Released on drop.
+pub(crate) struct TransferLock {
+    #[cfg(unix)]
+    _lock: unix::HeldLock,
+}
+
+/// Takes the transfer locks of the directories `names` on the device `device`, waiting for the
+/// invocations holding them. Best-effort: without them, invocations may transfer side by side,
+/// which costs time, not correctness.
+pub(crate) fn lock_transfers(device: &str, names: &[&str]) -> Vec<TransferLock> {
+    #[cfg(unix)]
+    {
+        let mut locks = Vec::new();
+        // Always in the same order - the build, then the files of the package - so that two
+        // invocations never wait for each other.
+        for name in names {
+            match unix::lock_exclusive(&format!("transfer-{device}-{name}")) {
+                Ok(lock) => locks.push(TransferLock { _lock: lock }),
+                Err(err) => log::warn!("Failed to lock the transfer of {name}: {err:#}"),
+            }
+        }
+        locks
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (device, names);
+        Vec::new()
+    }
+}
+
 fn is_session_id(id: &str) -> bool {
     id.len() == SESSION_ID_LEN && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -383,6 +415,53 @@ mod unix {
             return true;
         }
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    /// An exclusive lock on a file in the directory of the session files.
+    pub(super) struct HeldLock {
+        file: File,
+        path: PathBuf,
+    }
+
+    /// Takes the exclusive lock on the file `name`, waiting for whoever holds it.
+    pub(super) fn lock_exclusive(name: &str) -> anyhow::Result<HeldLock> {
+        let path = lock_dir()?.join(name);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("Failed to open {}", path.display()))?;
+        loop {
+            // SAFETY: flock takes a file descriptor, which `file` keeps open for the duration of
+            // the call, and flags.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(HeldLock { file, path });
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != ErrorKind::Interrupted {
+                return Err(err).with_context(|| format!("Failed to lock {}", path.display()));
+            }
+        }
+    }
+
+    impl Drop for HeldLock {
+        /// Removes the file, unless another invocation has replaced it already. An invocation
+        /// still waiting on the removed file then takes its lock unopposed, which at worst lets it
+        /// transfer side by side with a newcomer - after it found the transfer it waited for.
+        fn drop(&mut self) {
+            let same_file = match (self.file.metadata(), std::fs::symlink_metadata(&self.path)) {
+                (Ok(held), Ok(current)) => {
+                    held.ino() == current.ino() && held.dev() == current.dev()
+                }
+                _ => false,
+            };
+            if same_file {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
     }
 
     /// Takes the lock on `file` if nobody holds it.

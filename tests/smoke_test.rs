@@ -382,6 +382,86 @@ fn parallel_nextest_runs_share_one_transfer() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+/// The listing invocations nextest starts for a test binary find the device without the build at
+/// the same moment. One transfers it, and the others wait for that transfer.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires an OpenHarmony target toolchain, linker setup, hdc, a connected device, and cargo-nextest"]
+fn a_fresh_build_is_transferred_once() -> Result<(), Box<dyn std::error::Error>> {
+    if !cargo_nextest_available() {
+        return Err("cargo-nextest is not installed".into());
+    }
+    let project = TempProject::new()?;
+    let test_target = parallel_fixture_test_target(project.path())?;
+    write_parallel_fixture(project.path(), "transferred once")?;
+    let hdc = SendLoggingHdc::new(project.path())?;
+
+    let run = run_fixture_with_nextest(project.path(), &test_target, &[("PATH", &hdc.path()?)])?;
+    assert!(
+        run.status.success(),
+        "parallel run through ohos-test-runner failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let bin_name = test_target.replace('-', "_");
+    let sends = hdc.sends();
+    assert_eq!(
+        sends
+            .lines()
+            .filter(|send| send.contains(&bin_name))
+            .count(),
+        1,
+        "expected a single transfer of the binary, hdc sent: {sends}"
+    );
+    Ok(())
+}
+
+/// An `hdc` in front of the real one, which records the files it is asked to send.
+#[cfg(unix)]
+struct SendLoggingHdc {
+    dir: PathBuf,
+}
+
+#[cfg(unix)]
+impl SendLoggingHdc {
+    fn new(project_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let real_hdc = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("hdc"))
+            .find(|hdc| hdc.is_file())
+            .ok_or("hdc is not on PATH")?;
+        let dir = project_dir.join("hdc-bin");
+        fs::create_dir_all(&dir)?;
+        let hdc = dir.join("hdc");
+        fs::write(
+            &hdc,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$*\" in *'file send'*) printf '%s\\n' \"$*\" >> '{}';; esac\n\
+                 exec '{}' \"$@\"\n",
+                dir.join("sends").display(),
+                real_hdc.display(),
+            ),
+        )?;
+        fs::set_permissions(&hdc, fs::Permissions::from_mode(0o755))?;
+        Ok(Self { dir })
+    }
+
+    /// `PATH`, with this `hdc` in front of the real one.
+    fn path(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let path = std::env::join_paths(std::iter::once(self.dir.clone()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))?;
+        Ok(path.into_string().map_err(|_| "PATH is not utf-8")?)
+    }
+
+    /// The arguments of every `hdc file send`, one line each.
+    fn sends(&self) -> String {
+        fs::read_to_string(self.dir.join("sends")).unwrap_or_default()
+    }
+}
+
 /// Builds which have gone unused, and the files of invocations which were killed, are removed
 /// once the device directory is about to grow again.
 #[test]

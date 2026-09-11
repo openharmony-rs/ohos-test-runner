@@ -106,8 +106,9 @@ directory named after its contents:
 ```
 
 All the invocations of a build therefore share its transfer, instead of pushing the binary again
-for every test - only invocations which find the device without the build at the same moment
-transfer it side by side. A transfer never overwrites a binary another invocation is currently
+for every test. Invocations which find the device without the build at the same moment - like
+the listing invocations nextest starts for every test binary - wait for one of them to transfer
+it, on a Unix host; only invocations on different hosts may transfer it side by side. A transfer never overwrites a binary another invocation is currently
 executing: it arrives under a name of its own and is renamed into place. The directory of the
 previous build is removed once the new one arrives, unless a run which has not ended yet uses it.
 Short-lived changes to the directory, like these, happen under a lock on the device, so that
