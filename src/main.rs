@@ -20,13 +20,26 @@ use md5::Md5;
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::io::Read;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const TEST_BIN_DIR: &str = "/data/local/tmp/ohos-test-runner";
 
+/// Printed to stderr by the hdc client when it cannot reach the hdc server. hdc exits with
+/// status 0 all the same, so the failure is only visible in its output.
+const HDC_SERVER_UNREACHABLE: &str = "Connect server failed";
+
+/// Printed to stdout by the hdc client, with exit status 0, when it does not accept the address
+/// passed to `-s`.
+const HDC_SERVER_REJECTED: &[&str] = &["-s content IP incorrect.", "-s content port incorrect."];
+
 /// Environment variable to select the device (hdc connect-key) to run the binary on.
 const HDC_TARGET_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_TARGET";
+
+/// Environment variable naming the hdc server (`hdc -s`) to use, as `<host>:<port>`, for a
+/// device attached to another machine.
+const HDC_SERVER_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_SERVER";
 
 /// Environment variable listing shared libraries which the binary needs at runtime and which
 /// the device does not provide, in the platform's `PATH` format. `cargo-ohos` sets it when the
@@ -38,7 +51,11 @@ const ENV_VAR_PREFIX: &str = "OHOS_TEST_RUNNER";
 /// The user-facing environment variables of this tool. Variables with the [`ENV_VAR_PREFIX`]
 /// which are neither listed here nor in [`INTERNAL_ENV_VARS`] are reported to the user
 /// as unknown.
-const KNOWN_ENV_VARS: &[&str] = &[HDC_TARGET_ENV_VAR, RUNTIME_LIBRARIES_ENV_VAR];
+const KNOWN_ENV_VARS: &[&str] = &[
+    HDC_TARGET_ENV_VAR,
+    HDC_SERVER_ENV_VAR,
+    RUNTIME_LIBRARIES_ENV_VAR,
+];
 
 /// Internal environment variables, which are recognized to avoid spurious warnings,
 /// but not advertised to users.
@@ -47,22 +64,35 @@ const INTERNAL_ENV_VARS: &[&str] = &[
     "OHOS_TEST_RUNNER_INTEGRATION_TARGET",
 ];
 
-/// The hdc invocation, including the device selection (`-t`) if configured.
+/// The hdc invocation, including the server (`-s`) and the device selection (`-t`) if
+/// configured.
 struct Hdc {
+    /// The server address in the form `hdc -s` accepts: a numeric IP address and a port.
+    server: Option<String>,
     target: Option<String>,
 }
 
 impl Hdc {
-    fn from_env() -> Self {
-        let target = std::env::var(HDC_TARGET_ENV_VAR)
-            .ok()
-            .map(|target| target.trim().to_owned())
-            .filter(|target| !target.is_empty());
-        Self { target }
+    fn from_env() -> anyhow::Result<Self> {
+        let server = non_empty_env_var(HDC_SERVER_ENV_VAR)
+            .map(|server| resolve_server(&server))
+            .transpose()?;
+        let target = non_empty_env_var(HDC_TARGET_ENV_VAR);
+        Ok(Self { server, target })
     }
 
-    fn command(&self) -> Command {
+    /// An hdc command addressing the server, but no particular device.
+    fn server_command(&self) -> Command {
         let mut command = Command::new("hdc");
+        if let Some(server) = &self.server {
+            command.args(["-s", server]);
+        }
+        command
+    }
+
+    /// An hdc command addressing the selected device.
+    fn command(&self) -> Command {
+        let mut command = self.server_command();
         if let Some(target) = &self.target {
             command.args(["-t", target]);
         }
@@ -70,16 +100,129 @@ impl Hdc {
     }
 
     fn shell(&self, args: &[&str]) -> anyhow::Result<Output> {
-        self.command()
-            .arg("shell")
-            .args(args)
+        self.output(self.command().arg("shell").args(args))
+    }
+
+    /// Runs the hdc `command` to completion and captures its output, failing if hdc could not
+    /// reach its server.
+    fn output(&self, command: &mut Command) -> anyhow::Result<Output> {
+        let output = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("Failed to spawn hdc shell")?
+            .context("Failed to spawn hdc")?
             .wait_with_output()
-            .context("Failed to wait for hdc shell")
+            .context("Failed to wait for hdc")?;
+        let reported =
+            |message| reports(&output.stdout, message) || reports(&output.stderr, message);
+        if reported(HDC_SERVER_UNREACHABLE) {
+            bail!(self.unreachable_server_error());
+        }
+        if let Some(message) = HDC_SERVER_REJECTED
+            .iter()
+            .copied()
+            .find(|message| reported(message))
+        {
+            bail!(
+                "hdc does not accept the server address `{}` (`{message}`). Check \
+                 {HDC_SERVER_ENV_VAR}.",
+                self.server.as_deref().unwrap_or_default()
+            );
+        }
+        Ok(output)
     }
+
+    /// The connect-keys of the devices attached to the server.
+    fn list_targets(&self) -> anyhow::Result<String> {
+        let output = self.output(self.server_command().args(["list", "targets"]))?;
+        ensure_hdc_shell_success(&output, "Failed to list HDC targets")?;
+        let targets = String::from_utf8_lossy(&output.stdout).into_owned();
+        // A server without devices answers `[Empty]`. No answer at all comes from something
+        // which accepts the connection and closes it, e.g. an SSH tunnel without an hdc server
+        // at its other end.
+        if targets.trim().is_empty() {
+            bail!(self.silent_server_error());
+        }
+        Ok(targets)
+    }
+
+    fn unreachable_server_error(&self) -> String {
+        match &self.server {
+            None => format!(
+                "hdc cannot reach the hdc server (`{HDC_SERVER_UNREACHABLE}`). Check that the \
+                 server is running, e.g. with `hdc list targets`."
+            ),
+            Some(server) => format!(
+                "hdc cannot reach the hdc server at {server}, selected via {HDC_SERVER_ENV_VAR} \
+                 (`{HDC_SERVER_UNREACHABLE}`). Check that the server is running on that machine, \
+                 that it listens on an address reachable from here (a server started with \
+                 `-s 127.0.0.1:<port>` only accepts connections from its own machine, or through \
+                 a tunnel), and that no firewall blocks the port. `hdc -s {server} list targets` \
+                 tries the same connection."
+            ),
+        }
+    }
+
+    fn silent_server_error(&self) -> String {
+        match &self.server {
+            None => "The hdc server closed the connection without answering. Check that it is \
+                     the same hdc version as this client, with `hdc checkserver`."
+                .to_owned(),
+            Some(server) => format!(
+                "The hdc server at {server}, selected via {HDC_SERVER_ENV_VAR}, closed the \
+                 connection without answering. Either it is a different hdc version than this \
+                 client - `hdc -s {server} checkserver` shows both - or what accepts connections \
+                 there is not an hdc server: with an SSH tunnel, check that the hdc server is \
+                 running on the machine with the device, and that the tunnel forwards to its port."
+            ),
+        }
+    }
+}
+
+fn non_empty_env_var(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Resolves a `<host>:<port>` server address into the form `hdc -s` accepts, which takes neither
+/// host names nor the bracketed form of IPv6 addresses. IPv4 is preferred, since that is the
+/// form hdc servers listen on by default.
+fn resolve_server(server: &str) -> anyhow::Result<String> {
+    let addresses = server
+        .to_socket_addrs()
+        .with_context(|| {
+            format!(
+                "Cannot resolve the hdc server `{server}` from {HDC_SERVER_ENV_VAR}. Expected \
+                 `<host>:<port>`, e.g. `192.168.1.20:8710`."
+            )
+        })?
+        .collect::<Vec<SocketAddr>>();
+    let address = addresses
+        .iter()
+        .find(|address| address.is_ipv4())
+        .or(addresses.first())
+        .with_context(|| {
+            format!("The hdc server `{server}` from {HDC_SERVER_ENV_VAR} resolves to no address")
+        })?;
+    // hdc rejects port 0, and accepts an unspecified address like 0.0.0.0 - which is where a
+    // server listens, and reaches the server on this machine instead of the one meant.
+    if address.port() == 0 || address.ip().is_unspecified() {
+        bail!(
+            "The hdc server `{server}` from {HDC_SERVER_ENV_VAR} names no particular machine or \
+             port. Use the address of the machine the device is attached to, and the port its \
+             server listens on, e.g. `192.168.1.20:8710`."
+        );
+    }
+    Ok(format!("{}:{}", address.ip(), address.port()))
+}
+
+/// Whether hdc printed `message` on a line of its own. The lines of `hdc shell` end in CRLF.
+fn reports(output: &[u8], message: &str) -> bool {
+    String::from_utf8_lossy(output)
+        .lines()
+        .any(|line| line.trim() == message)
 }
 
 fn hash_file<D: Digest>(local_bin_path: &Path) -> anyhow::Result<String> {
@@ -238,18 +381,15 @@ fn send_file_to_device(
     let output = hdc.shell(&["mkdir", "-p", TEST_BIN_DIR])?;
     ensure_hdc_shell_success(&output, "Failed to create test directory on device")?;
 
-    let mut hdc_cmd = hdc.command();
-    hdc_cmd
-        .args(["file", "send"])
-        .arg(local_bin_path)
-        .arg(TEST_BIN_DIR);
-    let res = hdc_cmd
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("Failed to run hdc")
-        .wait_with_output()
-        .expect("Failed to get output of hdc");
+    let res = hdc.output(
+        hdc.command()
+            .args(["file", "send"])
+            .arg(local_bin_path)
+            .arg(TEST_BIN_DIR),
+    )?;
     assert!(res.status.success());
+    // Captured to recognize an unreachable server, but meant for the user.
+    eprint!("{}", String::from_utf8_lossy(&res.stderr));
     if !res.stdout.starts_with(b"FileTransfer finish") {
         // Don't bail for now, we still verify the file hash below anyway.
         log::warn!("Unexpected output from hdc. File transfer may have failed.");
@@ -362,6 +502,11 @@ Environment variables:
         The hdc connect-key (`hdc -t`) of the device to run the binary on. Required if
         multiple devices are attached, optional otherwise. Use `hdc list targets` to list
         the connect-keys of the attached devices.
+    {HDC_SERVER_ENV_VAR}
+        The hdc server (`hdc -s`) to use, as `<host>:<port>`, when the device is attached to
+        another machine. Unlike `hdc -s`, a host name is accepted. By default, hdc uses the
+        server on this machine. `hdc -s <ip>:<port> list targets` lists the connect-keys of
+        the devices attached to the other machine.
     {RUNTIME_LIBRARIES_ENV_VAR}
         Shared libraries the binary needs but the device does not provide, separated like
         `PATH`. They are sent next to the binary and found via `LD_LIBRARY_PATH`.
@@ -384,10 +529,6 @@ Example:
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     warn_about_unknown_env_vars();
-    let hdc = Hdc::from_env();
-    if let Some(target) = &hdc.target {
-        debug!("Using the hdc device `{target}` selected via {HDC_TARGET_ENV_VAR}");
-    }
     let mut args = std::env::args_os().skip(1);
     let Some(bin_path) = args.next() else {
         print_help();
@@ -406,6 +547,13 @@ fn main() -> anyhow::Result<()> {
         }
         _ => {}
     }
+    let hdc = Hdc::from_env()?;
+    if let Some(server) = &hdc.server {
+        debug!("Using the hdc server {server} selected via {HDC_SERVER_ENV_VAR}");
+    }
+    if let Some(target) = &hdc.target {
+        debug!("Using the hdc device `{target}` selected via {HDC_TARGET_ENV_VAR}");
+    }
     // potentially remaining args should be passed through to the test executable.
     let remaining_args = args
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -419,17 +567,8 @@ fn main() -> anyhow::Result<()> {
     let on_device_bin_path = format!("{TEST_BIN_DIR}/{}", bin_name.to_str().expect("utf-8"));
     debug!("Bin_path: {:?}", bin_path);
 
-    let targets = Command::new("hdc")
-        .args(["list", "targets"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn `hdc list targets`")?
-        .wait_with_output()
-        .context("Failed to wait for `hdc list targets`")?;
-    ensure_hdc_shell_success(&targets, "Failed to list HDC targets")?;
-    let targets_stdout = String::from_utf8_lossy(&targets.stdout);
-    check_device_selection(&targets_stdout, hdc.target.as_deref())?;
+    let targets = hdc.list_targets()?;
+    check_device_selection(&targets, hdc.target.as_deref())?;
 
     send_bin_to_device(&hdc, bin_path, &on_device_bin_path)
         .context("Failed to send binary to device")?;
@@ -473,16 +612,7 @@ fn main() -> anyhow::Result<()> {
         bail!("Non zero exit code from hdc: {res}");
     }
 
-    let mut hdc_cmd = hdc.command();
-    let res = hdc_cmd
-        .arg("shell")
-        .arg("cat")
-        .arg(exit_code_file)
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn hdc shell")?
-        .wait_with_output()
-        .context("Failed to wait for hdc shell")?;
+    let res = hdc.shell(&["cat", &exit_code_file])?;
     if !res.status.success() {
         bail!("Non zero exit code from hdc: {res:?}");
     }
@@ -498,7 +628,8 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::{
         check_device_selection, hash_tool_missing, parse_device_hash_output,
-        parse_runtime_libraries, unknown_env_vars,
+        parse_runtime_libraries, reports, resolve_server, unknown_env_vars, Hdc,
+        HDC_SERVER_REJECTED, HDC_SERVER_UNREACHABLE,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -580,6 +711,61 @@ mod tests {
     fn rejects_empty_target_list() {
         assert!(check_device_selection("[Empty]\n", Some("127.0.0.1:5555")).is_err());
         assert!(check_device_selection("", None).is_err());
+    }
+
+    #[test]
+    fn detects_an_unreachable_server() {
+        assert!(reports(b"Connect server failed\n", HDC_SERVER_UNREACHABLE));
+        assert!(reports(
+            b"Connect server failed\r\n",
+            HDC_SERVER_UNREACHABLE
+        ));
+        assert!(!reports(b"", HDC_SERVER_UNREACHABLE));
+        assert!(!reports(b"127.0.0.1:5555\n", HDC_SERVER_UNREACHABLE));
+        for message in HDC_SERVER_REJECTED {
+            assert!(reports(format!("{message}\n").as_bytes(), message));
+        }
+    }
+
+    #[test]
+    fn resolves_the_server_into_the_form_hdc_accepts() {
+        assert_eq!(
+            resolve_server("192.168.1.20:8710").unwrap(),
+            "192.168.1.20:8710"
+        );
+        // hdc rejects host names, and IPv4 is what an hdc server listens on by default.
+        assert_eq!(resolve_server("localhost:8710").unwrap(), "127.0.0.1:8710");
+        // hdc rejects the bracketed form.
+        assert_eq!(resolve_server("[::1]:8710").unwrap(), "::1:8710");
+        assert!(resolve_server("8710").is_err());
+        assert!(resolve_server("192.168.1.20").is_err());
+        // hdc rejects port 0, and an unspecified address reaches the server on this machine.
+        assert!(resolve_server("localhost:0").is_err());
+        assert!(resolve_server("0.0.0.0:8710").is_err());
+        assert!(resolve_server("[::]:8710").is_err());
+    }
+
+    #[test]
+    fn the_server_precedes_the_device_selection() {
+        let hdc = Hdc {
+            server: Some("127.0.0.1:8710".to_owned()),
+            target: Some("127.0.0.1:5555".to_owned()),
+        };
+        assert_eq!(
+            hdc.command().get_args().collect::<Vec<_>>(),
+            ["-s", "127.0.0.1:8710", "-t", "127.0.0.1:5555"]
+        );
+        // Listing the devices addresses the server only.
+        assert_eq!(
+            hdc.server_command().get_args().collect::<Vec<_>>(),
+            ["-s", "127.0.0.1:8710"]
+        );
+
+        let local = Hdc {
+            server: None,
+            target: None,
+        };
+        assert_eq!(local.command().get_args().count(), 0);
     }
 
     #[test]
