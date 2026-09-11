@@ -83,6 +83,11 @@ fn runs_through_an_explicit_hdc_server() -> Result<(), Box<dyn std::error::Error
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
+    // The watcher of the run uses hdc too, once the run has ended.
+    let bin_prefix = project.device_bin_prefix().ok_or("no binary name")?;
+    wait_until("the build of the run is removed", CLEANUP_TIMEOUT, || {
+        Ok(build_dirs_starting_with(&bin_prefix)?.is_empty())
+    })?;
     assert_eq!(
         hdc.invocations_without_server(),
         "",
@@ -280,7 +285,7 @@ impl Drop for TempProject {
         if let Some(prefix) = self.device_bin_prefix() {
             if let Ok(dirs) = build_dirs_starting_with(&prefix) {
                 for dir in dirs {
-                    let _ = hdc_shell(&["rm", "-rf", &format!("{TEST_BIN_DIR}/{dir}")]);
+                    remove_device_dir(&dir);
                 }
             }
         }
@@ -477,7 +482,7 @@ fn declared_fixtures_are_readable_from_the_test() -> Result<(), Box<dyn std::err
     );
 
     for dir in mirrors {
-        let _ = hdc_shell(&["rm", "-rf", &format!("{TEST_BIN_DIR}/{dir}")]);
+        remove_device_dir(&dir);
     }
     Ok(())
 }
@@ -492,6 +497,20 @@ fn builds_are_removed_when_the_run_ends() -> Result<(), Box<dyn std::error::Erro
     let bin_prefix = project.device_bin_prefix().ok_or("no binary name")?;
     let fixtures = ("OHOS_TEST_RUNNER_FIXTURES", "tests/data");
 
+    let run = run_fixture_test_case_with_env(project.path(), FIXTURE_READING_CASE, &[fixtures])?;
+    assert!(
+        run.status.success(),
+        "the run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    wait_until("the builds of the run are removed", CLEANUP_TIMEOUT, || {
+        Ok(build_dirs_starting_with(&bin_prefix)?.is_empty()
+            && device_dirs_holding(&fixture_file)?.is_empty())
+    })?;
+
+    // The same build again, keeping its builds this time: they stay for the collection of unused
+    // builds.
     let kept = run_fixture_test_case_with_env(
         project.path(),
         FIXTURE_READING_CASE,
@@ -510,24 +529,14 @@ fn builds_are_removed_when_the_run_ends() -> Result<(), Box<dyn std::error::Erro
         1,
         "the build was not kept"
     );
-    assert_eq!(
-        device_dirs_holding(&fixture_file)?.len(),
-        1,
-        "the mirror was not kept"
-    );
+    let mirrors = device_dirs_holding(&fixture_file)?;
+    assert_eq!(mirrors.len(), 1, "the mirror was not kept");
 
-    // The same build again, which reuses what the previous run kept, and removes it at its end.
-    let run = run_fixture_test_case_with_env(project.path(), FIXTURE_READING_CASE, &[fixtures])?;
-    assert!(
-        run.status.success(),
-        "the run failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
-    );
-    wait_until("the builds of the run are removed", CLEANUP_TIMEOUT, || {
-        Ok(build_dirs_starting_with(&bin_prefix)?.is_empty()
-            && device_dirs_holding(&fixture_file)?.is_empty())
-    })
+    // The project removes the builds when it goes, but not the mirror.
+    for dir in mirrors {
+        remove_device_dir(&dir);
+    }
+    Ok(())
 }
 
 /// The invocations of a nextest run share its builds, which leave the device once the whole run
@@ -572,19 +581,22 @@ fn builds_are_removed_after_an_interrupted_run() -> Result<(), Box<dyn std::erro
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    // Building the fixture comes first, and takes a while.
+    let interrupt = |signal: &str| {
+        Command::new("kill")
+            .args([signal, "--", &format!("-{}", run.id())])
+            .status()
+    };
+    // Building the fixture comes first, and takes a while. The binary is renamed into place
+    // after its transfer, right before the test starts.
     let waited = wait_until("the binary arrives on the device", BUILD_TIMEOUT, || {
-        Ok(!build_dirs_starting_with(&bin_prefix)?.is_empty())
+        Ok(!installed_binaries_starting_with(&bin_prefix)?.is_empty())
     });
     if let Err(err) = waited {
-        let _ = run.kill();
+        let _ = interrupt("-KILL");
         return Err(err);
     }
     std::thread::sleep(Duration::from_secs(1));
-    let interrupted = Command::new("kill")
-        .args(["-INT", "--", &format!("-{}", run.id())])
-        .status()?;
-    assert!(interrupted.success(), "failed to interrupt the run");
+    assert!(interrupt("-INT")?.success(), "failed to interrupt the run");
     assert!(!run.wait()?.success(), "the interrupted run succeeded");
 
     wait_until(
@@ -592,6 +604,90 @@ fn builds_are_removed_after_an_interrupted_run() -> Result<(), Box<dyn std::erro
         CLEANUP_TIMEOUT,
         || Ok(build_dirs_starting_with(&bin_prefix)?.is_empty()),
     )
+}
+
+/// The unit tests of a library and its integration tests are two binaries reading the same files,
+/// which the listing invocations of nextest send to the device at the same time. The mirror has to
+/// end up with every file in its place, not with a copy nested inside another.
+#[test]
+#[ignore = "requires an OpenHarmony target toolchain, linker setup, hdc, a connected device, and cargo-nextest"]
+fn fixtures_shared_by_two_binaries_are_mirrored_once() -> Result<(), Box<dyn std::error::Error>> {
+    if !cargo_nextest_available() {
+        return Err("cargo-nextest is not installed".into());
+    }
+    let project = TempProject::new()?;
+    let fixture_file = write_fixture_reading_project(project.path())?;
+    fs::create_dir_all(project.path().join("src"))?;
+    fs::write(
+        project.path().join("src/lib.rs"),
+        format!(
+            "#[test]\nfn {FIXTURE_READING_CASE}() {{\n    \
+             let contents = std::fs::read_to_string(\"{fixture_file}\").unwrap();\n    \
+             assert_eq!(contents.trim(), \"{FIXTURE_CONTENTS}\");\n}}\n"
+        ),
+    )?;
+
+    let run = run_nextest(
+        project.path(),
+        &[],
+        &[("OHOS_TEST_RUNNER_FIXTURES", "tests/data"), KEEP_BUILDS],
+    )?;
+    assert!(
+        run.status.success(),
+        "the tests could not read the files they declared\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let mirrors = device_dirs_holding(&fixture_file)?;
+    assert_eq!(mirrors.len(), 1, "expected one mirror, found: {mirrors:?}");
+    let nested = hdc_shell(&[
+        "find",
+        &format!("{TEST_BIN_DIR}/{}", mirrors[0]),
+        "-path",
+        "*/data/data*",
+    ])?;
+    assert_eq!(nested.trim(), "", "files nested inside the mirror");
+
+    for dir in mirrors {
+        remove_device_dir(&dir);
+    }
+    Ok(())
+}
+
+/// A build directory which has gone unused for longer than the collection allows, and lost its
+/// binary, e.g. to a transfer which was interrupted, is filled again rather than collected from
+/// under the transfer.
+#[test]
+#[ignore = "requires an OpenHarmony target toolchain, linker setup, hdc, and a connected device"]
+fn a_stale_build_directory_is_filled_again() -> Result<(), Box<dyn std::error::Error>> {
+    let project = TempProject::new()?;
+    write_smoke_test_fixture(project.path())?;
+    let bin_prefix = project.device_bin_prefix().ok_or("no binary name")?;
+
+    let first =
+        run_fixture_test_case_with_env(project.path(), FIXTURE_PASSING_CASE, &[KEEP_BUILDS])?;
+    assert!(first.status.success(), "the first run failed");
+    let dirs = build_dirs_starting_with(&bin_prefix)?;
+    assert_eq!(
+        dirs.len(),
+        1,
+        "expected one build directory, found: {dirs:?}"
+    );
+    let dir = format!("{TEST_BIN_DIR}/{}", dirs[0]);
+    hdc_shell(&[&format!(
+        "rm -f {dir}/{bin_prefix}*; touch -d '2020-01-01 00:00:00' {dir}"
+    )])?;
+
+    // Keeping the builds, since the marker of a session refreshes the directory in passing.
+    let second =
+        run_fixture_test_case_with_env(project.path(), FIXTURE_PASSING_CASE, &[KEEP_BUILDS])?;
+    assert!(
+        second.status.success(),
+        "the run into the stale build directory failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    Ok(())
 }
 
 /// Waits for `done` to hold, looking again every 200 ms.
@@ -698,6 +794,19 @@ fn run_fixture_with_nextest(
     test_target: &str,
     extra_env: &[(&str, &str)],
 ) -> Result<Output, Box<dyn std::error::Error>> {
+    run_nextest(
+        project_dir,
+        &["--test", test_target, "--test-threads", PARALLEL_JOBS],
+        extra_env,
+    )
+}
+
+/// `cargo nextest run` of the fixture in `project_dir`, through the runner.
+fn run_nextest(
+    project_dir: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Result<Output, Box<dyn std::error::Error>> {
     let target = std::env::var("OHOS_TEST_RUNNER_INTEGRATION_TARGET")
         .unwrap_or_else(|_| DEFAULT_OHOS_TARGET.to_owned());
     let runner_env_var = cargo_target_runner_env_var(&target);
@@ -710,10 +819,7 @@ fn run_fixture_with_nextest(
         .envs(extra_env.iter().copied())
         .args(["nextest", "run", "--target"])
         .arg(&target)
-        .arg("--test")
-        .arg(test_target)
-        .arg("--test-threads")
-        .arg(PARALLEL_JOBS)
+        .args(args)
         .env(&runner_env_var, env!("CARGO_BIN_EXE_ohos-test-runner"))
         .env(&linker_env_var, linker)
         .current_dir(project_dir)
@@ -734,6 +840,21 @@ fn build_dirs_of(test_target: &str) -> Result<Vec<String>, Box<dyn std::error::E
 /// The directories under [`TEST_BIN_DIR`] holding a binary whose name starts with `bin_prefix`.
 fn build_dirs_starting_with(bin_prefix: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     device_dirs_holding(&format!("{bin_prefix}*"))
+}
+
+/// The binaries under [`TEST_BIN_DIR`] whose name starts with `bin_prefix`, which are in place,
+/// as opposed to on their way there.
+fn installed_binaries_starting_with(
+    bin_prefix: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(
+        hdc_shell(&["ls", "-1", &format!("{TEST_BIN_DIR}/*/{bin_prefix}*")])?
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with(TEST_BIN_DIR) && !line.ends_with(".incoming"))
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 /// The directories under [`TEST_BIN_DIR`] which hold `relative`, a path inside one of them.
@@ -777,6 +898,14 @@ fn wait_until_no_exit_code_files_are_left() -> Result<(), Box<dyn std::error::Er
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// Removes the directory `name` from [`TEST_BIN_DIR`], with the markers of the sessions which used
+/// it, like the runner does.
+fn remove_device_dir(name: &str) {
+    let _ = hdc_shell(&[&format!(
+        "rm -rf {TEST_BIN_DIR}/{name} {TEST_BIN_DIR}/.sessions/*/{name}"
+    )]);
 }
 
 /// Runs `hdc shell` against the device the runner uses. Unlike the runner, this passes

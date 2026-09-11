@@ -1,25 +1,36 @@
 //! Removes the builds of a run from the device once the run ends.
 //!
-//! A run is the process which invokes the runner: `cargo` for `cargo test`, which invokes it once
-//! per test binary, and `cargo-nextest` for `cargo nextest run`, which invokes it once per test.
-//! The invocations of a run share the builds on the device, so none of them can remove a build
-//! when it is done. Instead, the first invocation starts a watcher, which waits for the run to end
-//! and then removes the directories the run used - unless another run still uses them.
+//! A run is the `cargo` process of a `cargo test`, which invokes the runner once per test binary,
+//! or the `cargo-nextest` process of a `cargo nextest run`, which invokes it once per test. The
+//! invocations of a run share the builds on the device, so none of them can remove a build when it
+//! is done. Instead, the first invocation starts a watcher, which waits for the run to end and then
+//! removes the directories the run used - unless another run still uses them.
 //!
-//! Every invocation marks the directories it uses with a file named after the session of its run,
-//! in [`SESSIONS_DIR`]. The watcher removes the markers of its session, and with them every
-//! directory no other session has marked.
+//! Every invocation marks the directories it uses with a file `<SESSIONS_DIR>/<session>/<name>`,
+//! under the device lock and before it relies on them. The watcher removes the markers of its
+//! session, and every directory no other session has marked.
 
-use crate::{ensure_hdc_shell_success, shell_quote, Hdc, TEST_BIN_DIR};
+use crate::{
+    ensure_hdc_shell_success, has_marker, shell_quote, with_device_lock, Hdc, LOCK_TIMEOUT_MARKER,
+    TEST_BIN_DIR,
+};
 use anyhow::{bail, Context};
 
-/// The directory inside a build or fixture directory, which holds a marker file for every session
-/// using it.
+/// The directory in [`TEST_BIN_DIR`] which holds a directory of markers for every session.
 pub(crate) const SESSIONS_DIR: &str = ".sessions";
 
 /// The first argument which makes the runner the watcher of a session, followed by the pid of the
-/// run and the id of the session.
+/// run, the id of the session, and the name of its session file.
 pub(crate) const WATCH_FLAG: &str = "--cleanup-after";
+
+/// The session of the runs which keep their builds, and of the runs which could not start a
+/// session of their own. No watcher removes its markers, and the collection of unused builds
+/// ignores them, so they only keep the directories from being removed by the end of another run.
+const KEEP_SESSION: &str = "keep";
+
+/// How long a marker keeps a directory from being collected as unused. A marker older than this
+/// belongs to a run whose watcher never got to remove it.
+pub(crate) const MARKER_TTL_MINUTES: u64 = 24 * 60;
 
 const SESSION_ID_LEN: usize = 16;
 
@@ -29,74 +40,101 @@ pub(crate) struct Session {
 }
 
 impl Session {
+    pub(crate) fn keep() -> Self {
+        Self {
+            id: KEEP_SESSION.to_owned(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn with_id(id: &str) -> Self {
         Self { id: id.to_owned() }
     }
 
-    /// The shell command which marks `dir` as used by this session.
-    pub(crate) fn mark_command(&self, dir: &str) -> String {
-        format!(
-            "mkdir -p {} && touch {}",
-            shell_quote(&format!("{dir}/{SESSIONS_DIR}")),
-            shell_quote(&format!("{dir}/{SESSIONS_DIR}/{}", self.id))
-        )
+    /// The shell command which marks the directories `names` in [`TEST_BIN_DIR`] as used by this
+    /// session. The directories need not exist yet.
+    pub(crate) fn mark_command(&self, names: &[&str]) -> String {
+        let dir = format!("{TEST_BIN_DIR}/{SESSIONS_DIR}/{}", self.id);
+        let mut command = format!("mkdir -p {} && touch", shell_quote(&dir));
+        for name in names {
+            command.push(' ');
+            command.push_str(&shell_quote(&format!("{dir}/{name}")));
+        }
+        command
     }
+}
+
+/// A shell condition, run in [`TEST_BIN_DIR`], which holds if a run which has not ended yet has
+/// marked the directory named by the variable `$name`. The markers of the runs which keep their
+/// builds do not count: those runs leave their builds to the collection of unused builds.
+pub(crate) fn marked_by_a_run() -> String {
+    format!("ls {SESSIONS_DIR}/[0-9a-f]*/\"$name\" >/dev/null 2>&1")
 }
 
 /// Joins the session of the run which invoked this runner, starting it and its watcher if this is
 /// the first invocation of the run.
 ///
-/// `None` when the builds cannot be removed at the end of the run, which leaves them to the
-/// collection of unused builds.
-pub(crate) fn join() -> Option<Session> {
+/// Where no session can be started, the builds are marked as kept instead, which leaves them to
+/// the collection of unused builds.
+pub(crate) fn join() -> Session {
     #[cfg(unix)]
     match unix::join() {
-        Ok(session) => return Some(session),
+        Ok(session) => return session,
         Err(err) => log::warn!("The builds of this run stay on the device after it: {err:#}"),
     }
-    None
+    Session::keep()
 }
 
 /// Waits for the run with the pid `owner` to end, and then removes the directories which only the
-/// session `id` uses from the device.
-pub(crate) fn watch(owner: &str, id: &str) -> anyhow::Result<()> {
+/// session `id` uses from the device. `lock_name` is the session file, which is removed on the way
+/// out.
+pub(crate) fn watch(owner: &str, id: &str, lock_name: &str) -> anyhow::Result<()> {
     let owner = owner
         .parse::<u32>()
+        .ok()
+        .filter(|&pid| pid > 1 && i32::try_from(pid).is_ok())
         .with_context(|| format!("Invalid pid of the run: {owner}"))?;
     if !is_session_id(id) {
         bail!("Invalid session id: {id}");
     }
     #[cfg(unix)]
+    let _lock = unix::SessionFile::new(lock_name)?;
+    #[cfg(unix)]
     unix::wait_for_exit(owner);
     #[cfg(not(unix))]
-    let _ = owner;
+    let _ = (owner, lock_name);
+
     let hdc = Hdc::from_env()?;
     let output = hdc.shell(&[&cleanup_command(id)])?;
     ensure_hdc_shell_success(
         &output,
         "Failed to remove the builds of the run from the device",
     )?;
-    #[cfg(unix)]
-    unix::remove_lock(owner);
+    if has_marker(
+        &String::from_utf8_lossy(&output.stdout),
+        LOCK_TIMEOUT_MARKER,
+    ) {
+        bail!("Timed out waiting for the lock on the device");
+    }
     Ok(())
 }
 
 /// Removes the markers of the session `id`, and every directory no other session has marked.
-///
-/// `rmdir` only removes the directory of the markers once it is empty, so of two sessions ending
-/// at the same time, exactly one removes a directory they shared.
 pub(crate) fn cleanup_command(id: &str) -> String {
-    let marker = shell_quote(&format!("{SESSIONS_DIR}/{id}"));
-    let sessions = shell_quote(SESSIONS_DIR);
+    let markers = format!("{SESSIONS_DIR}/{id}");
+    let cleanup = format!(
+        "for marker in {markers}/*; do \
+         [ -e \"$marker\" ] || continue; \
+         name=\"${{marker##*/}}\"; \
+         rm -f \"$marker\"; \
+         ls {SESSIONS_DIR}/*/\"$name\" >/dev/null 2>&1 || rm -rf \"$name\"; \
+         done; \
+         rmdir {markers} 2>/dev/null; true",
+        markers = shell_quote(&markers),
+    );
     format!(
-        "cd {TEST_BIN_DIR} 2>/dev/null || exit 0; \
-         for dir in */; do \
-         dir=\"${{dir%/}}\"; \
-         [ -e \"$dir\"/{marker} ] || continue; \
-         rm -f \"$dir\"/{marker}; \
-         rmdir \"$dir\"/{sessions} 2>/dev/null && rm -rf \"$dir\"; \
-         done"
+        "cd {TEST_BIN_DIR} 2>/dev/null || exit 0; {}",
+        with_device_lock(&cleanup, &format!("echo {LOCK_TIMEOUT_MARKER}"))
     )
 }
 
@@ -104,11 +142,37 @@ fn is_session_id(id: &str) -> bool {
     id.len() == SESSION_ID_LEN && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// The fields of `/proc/<pid>/stat` which identify a process and its parent.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+struct ProcStat {
+    comm: String,
+    ppid: u32,
+    /// When the process started, in clock ticks since boot. Together with the pid, it identifies
+    /// a process: the pid of a process which has ended can be reused, but not with the same start.
+    start_time: u64,
+}
+
+/// Parses `/proc/<pid>/stat`. The name of the process comes in parentheses, and may contain spaces
+/// and parentheses itself, so the fields are counted from the last closing parenthesis.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_stat(stat: &str) -> Option<ProcStat> {
+    let (head, rest) = stat.rsplit_once(')')?;
+    let comm = head.split_once('(')?.1.to_owned();
+    // `rest` starts with the third field, the state.
+    let fields = rest.split_whitespace().collect::<Vec<&str>>();
+    Some(ProcStat {
+        comm,
+        ppid: fields.get(1)?.parse().ok()?,
+        start_time: fields.get(19)?.parse().ok()?,
+    })
+}
+
 #[cfg(unix)]
 mod unix {
-    use super::{is_session_id, Session, SESSION_ID_LEN, WATCH_FLAG};
+    use super::{is_session_id, Session, WATCH_FLAG};
+    use crate::random_id;
     use anyhow::{bail, Context};
-    use sha2::{Digest, Sha256};
     use std::fs::{File, OpenOptions};
     use std::io::{ErrorKind, Write};
     use std::os::fd::AsRawFd;
@@ -116,20 +180,20 @@ mod unix {
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant, SystemTime};
+    use std::time::{Duration, Instant};
 
-    /// How long an invocation waits for the first invocation of its run to write the session id.
+    /// How long an invocation waits for the first invocation of its run to start the watcher.
     const SESSION_ID_TIMEOUT: Duration = Duration::from_secs(1);
 
     /// How often the watcher checks whether the run still exists, where it cannot wait for it.
     const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-    /// The session of a run is recorded in a file named after the run's pid. The watcher holds a
-    /// lock on it for as long as it lives, so a file nobody holds a lock on was left behind by a
-    /// run which has ended, and whose pid a new run happens to have.
+    /// The session of a run is recorded in a file named after the run. The watcher holds a lock on
+    /// it for as long as it lives, so a file nobody holds a lock on belongs to a run which has not
+    /// started its watcher yet, or whose watcher is gone.
     pub(super) fn join() -> anyhow::Result<Session> {
-        let owner = std::os::unix::process::parent_id();
-        let path = lock_path(owner)?;
+        let owner = find_owner();
+        let path = lock_dir()?.join(&owner.key);
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -140,19 +204,21 @@ mod unix {
             .with_context(|| format!("Failed to open {}", path.display()))?;
 
         if try_lock(&file)? {
-            // The first invocation of the run: nobody has written its session id yet.
+            // The first invocation of the run. The id is written only once the watcher runs, so
+            // that the other invocations never join a session nobody watches.
             file.set_len(0)?;
-            let id = new_session_id(owner);
+            let id = random_id();
+            spawn_watcher(owner.pid, &id, &owner.key, file.try_clone()?)?;
             file.write_all(id.as_bytes())?;
-            spawn_watcher(owner, &id, file)?;
+            log::debug!("Started the session {id} of the run {}", owner.pid);
             return Ok(Session { id });
         }
 
-        // The first invocation of the run holds the lock, and writes the id right after taking it.
         let deadline = Instant::now() + SESSION_ID_TIMEOUT;
         loop {
             let id = std::fs::read_to_string(&path)?;
             if is_session_id(&id) {
+                log::debug!("Joined the session {id} of the run {}", owner.pid);
                 return Ok(Session { id });
             }
             if Instant::now() >= deadline {
@@ -162,14 +228,64 @@ mod unix {
         }
     }
 
+    /// The process whose end is the end of the run, and the name of its session file.
+    struct Owner {
+        pid: u32,
+        key: String,
+    }
+
+    /// The nearest `cargo` or `cargo-nextest` among the ancestors, so that a wrapper script in
+    /// between, which does not `exec` the runner, still leaves all invocations of the run in one
+    /// session. Without one, the parent: whatever invokes the runner repeatedly.
+    #[cfg(target_os = "linux")]
+    fn find_owner() -> Owner {
+        const MAX_DEPTH: usize = 8;
+
+        let proc_stat = |pid: u32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| super::parse_proc_stat(&stat))
+        };
+        let parent = std::os::unix::process::parent_id();
+        let owner = |pid: u32, start_time: u64| Owner {
+            pid,
+            key: format!("{pid}-{start_time}"),
+        };
+
+        let mut pid = parent;
+        for _ in 0..MAX_DEPTH {
+            let Some(stat) = proc_stat(pid) else {
+                break;
+            };
+            if matches!(stat.comm.as_str(), "cargo" | "cargo-nextest") {
+                return owner(pid, stat.start_time);
+            }
+            if stat.ppid <= 1 {
+                break;
+            }
+            pid = stat.ppid;
+        }
+        owner(parent, proc_stat(parent).map_or(0, |stat| stat.start_time))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn find_owner() -> Owner {
+        let pid = std::os::unix::process::parent_id();
+        Owner {
+            pid,
+            key: pid.to_string(),
+        }
+    }
+
     /// Starts the watcher of the session, which inherits the lock on the session file as its
     /// stdin and so holds it until it exits.
-    fn spawn_watcher(owner: u32, id: &str, lock: File) -> anyhow::Result<()> {
-        let exe = std::env::current_exe().context("Failed to find the runner's executable")?;
+    fn spawn_watcher(owner: u32, id: &str, lock_name: &str, lock: File) -> anyhow::Result<()> {
+        let exe = runner_executable()?;
         let watcher = Command::new(exe)
             .arg(WATCH_FLAG)
             .arg(owner.to_string())
             .arg(id)
+            .arg(lock_name)
             .stdin(Stdio::from(lock))
             // cargo and nextest wait for the output pipes of the runner to close.
             .stdout(Stdio::null())
@@ -182,6 +298,38 @@ mod unix {
         // The watcher outlives this invocation, and is adopted by init once this invocation exits.
         drop(watcher);
         Ok(())
+    }
+
+    /// The executable of this runner. On Linux, `/proc/self/exe` still works when the file has
+    /// been replaced since the runner started, e.g. by a `cargo install` during the run.
+    fn runner_executable() -> anyhow::Result<PathBuf> {
+        #[cfg(target_os = "linux")]
+        return Ok(PathBuf::from("/proc/self/exe"));
+        #[cfg(not(target_os = "linux"))]
+        return std::env::current_exe().context("Failed to find the runner's executable");
+    }
+
+    /// The session file of a run, which the watcher removes however it exits.
+    pub(super) struct SessionFile {
+        path: PathBuf,
+    }
+
+    impl SessionFile {
+        pub(super) fn new(name: &str) -> anyhow::Result<Self> {
+            if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+                bail!("Invalid session file name: {name}");
+            }
+            Ok(Self {
+                path: lock_dir()?.join(name),
+            })
+        }
+    }
+
+    impl Drop for SessionFile {
+        fn drop(&mut self) {
+            // Still locked by this watcher, so no other run can be using the file.
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 
     /// Waits for the process `pid` to exit. It is not a child of this process, so it cannot be
@@ -227,6 +375,8 @@ mod unix {
         }
     }
 
+    /// Whether the process `pid` exists. `watch` only accepts pids above 1 which fit a `pid_t`, so
+    /// this never addresses a process group or every process.
     fn is_alive(pid: u32) -> bool {
         // SAFETY: signal 0 sends nothing, it only checks whether the process exists.
         if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
@@ -249,17 +399,9 @@ mod unix {
         Err(err).context("Failed to lock the session file")
     }
 
-    /// Removes the session file of the run `owner`. The watcher calls this while it still holds
-    /// the lock, so no other run can have started to use the file.
-    pub(super) fn remove_lock(owner: u32) {
-        if let Ok(path) = lock_path(owner) {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
-    /// The session file of the run `owner`, in a directory only this user can write to, since
-    /// the directory for temporary files is usually shared.
-    fn lock_path(owner: u32) -> anyhow::Result<PathBuf> {
+    /// The directory of the session files, private to this user, since the directory for
+    /// temporary files is usually shared.
+    fn lock_dir() -> anyhow::Result<PathBuf> {
         let base = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
@@ -279,37 +421,26 @@ mod unix {
         if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
             bail!("{} is not a directory private to this user", dir.display());
         }
-        Ok(dir.join(owner.to_string()))
-    }
-
-    fn new_session_id(owner: u32) -> String {
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let mut hasher = Sha256::new();
-        hasher.update(format!("{owner} {} {nanos}", std::process::id()));
-        let mut id = hex::encode(hasher.finalize());
-        id.truncate(SESSION_ID_LEN);
-        id
+        Ok(dir)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_command, is_session_id, Session, SESSIONS_DIR};
+    use super::{
+        cleanup_command, is_session_id, marked_by_a_run, parse_proc_stat, ProcStat, Session,
+        SESSIONS_DIR,
+    };
+    use crate::TEST_BIN_DIR;
 
     #[test]
-    fn marks_a_directory_for_the_session() {
-        let session = Session {
-            id: "0123456789abcdef".to_owned(),
-        };
-        let command = session.mark_command("/data/local/tmp/ohos-test-runner/fedcba9876543210");
+    fn marks_directories_for_the_session() {
+        let command = Session::with_id("0123456789abcdef").mark_command(&["fedcba9876543210"]);
         assert_eq!(
             command,
             format!(
-                "mkdir -p '/data/local/tmp/ohos-test-runner/fedcba9876543210/{SESSIONS_DIR}' && \
-                 touch '/data/local/tmp/ohos-test-runner/fedcba9876543210/{SESSIONS_DIR}/0123456789abcdef'"
+                "mkdir -p '{TEST_BIN_DIR}/{SESSIONS_DIR}/0123456789abcdef' && \
+                 touch '{TEST_BIN_DIR}/{SESSIONS_DIR}/0123456789abcdef/fedcba9876543210'"
             )
         );
     }
@@ -318,15 +449,29 @@ mod tests {
     fn the_cleanup_only_removes_directories_no_other_session_uses() {
         let command = cleanup_command("0123456789abcdef");
         assert!(
-            command.contains(&format!("rm -f \"$dir\"/'{SESSIONS_DIR}/0123456789abcdef'")),
-            "{command}"
-        );
-        assert!(
             command.contains(&format!(
-                "rmdir \"$dir\"/'{SESSIONS_DIR}' 2>/dev/null && rm -rf \"$dir\""
+                "for marker in '{SESSIONS_DIR}/0123456789abcdef'/*"
             )),
             "{command}"
         );
+        // Any other marker counts, including those of the runs which keep their builds.
+        assert!(
+            command.contains(&format!(
+                "ls {SESSIONS_DIR}/*/\"$name\" >/dev/null 2>&1 || rm -rf \"$name\""
+            )),
+            "{command}"
+        );
+        assert!(command.contains("flock -n 9"), "{command}");
+    }
+
+    #[test]
+    fn only_the_markers_of_ongoing_runs_protect_from_the_collection() {
+        // Session ids are hex, the session of the runs keeping their builds is not.
+        assert_eq!(
+            marked_by_a_run(),
+            format!("ls {SESSIONS_DIR}/[0-9a-f]*/\"$name\" >/dev/null 2>&1")
+        );
+        assert!(!"keep".starts_with(|c: char| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -334,6 +479,22 @@ mod tests {
         assert!(is_session_id("0123456789abcdef"));
         assert!(!is_session_id("0123456789abcde"));
         assert!(!is_session_id("0123456789abcdeg"));
+        assert!(!is_session_id("keep"));
         assert!(!is_session_id("'; rm -rf / #aaa"));
+    }
+
+    #[test]
+    fn parses_proc_stat() {
+        let stat = "4242 (cargo (x) y) S 4200 4242 4200 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 \
+                    987654 1000 100";
+        assert_eq!(
+            parse_proc_stat(stat),
+            Some(ProcStat {
+                comm: "cargo (x) y".to_owned(),
+                ppid: 4200,
+                start_time: 987654,
+            })
+        );
+        assert_eq!(parse_proc_stat("garbage"), None);
     }
 }

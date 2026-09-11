@@ -220,8 +220,14 @@ fn the_watcher_cleans_up_when_the_run_ends() {
         .expect("failed to start a stand-in for the run");
     let mut watcher = hdc
         .runner()
-        .args(["--cleanup-after", &run.id().to_string(), "0123456789abcdef"])
+        .args([
+            "--cleanup-after",
+            &run.id().to_string(),
+            "0123456789abcdef",
+            "cli-test-session",
+        ])
         .env_remove("OHOS_TEST_RUNNER_HDC_SERVER")
+        .env_remove("OHOS_TEST_RUNNER_HDC_TARGET")
         .spawn()
         .expect("failed to start the watcher");
 
@@ -260,7 +266,12 @@ fn the_watcher_cleans_up_when_the_run_ends() {
 #[test]
 fn the_watcher_rejects_a_malformed_session_id() {
     let output = Command::new(env!("CARGO_BIN_EXE_ohos-test-runner"))
-        .args(["--cleanup-after", "1", "'; rm -rf / #"])
+        .args([
+            "--cleanup-after",
+            "4242",
+            "'; rm -rf / #",
+            "cli-test-session",
+        ])
         .output()
         .expect("failed to run ohos-test-runner");
     assert!(!output.status.success());

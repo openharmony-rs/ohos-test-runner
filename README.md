@@ -97,28 +97,35 @@ this tool. Run `ohos-test-runner --help` for the list of supported variables.
 Several runner invocations may target the same device at the same time. This is what
 `cargo nextest` does, since it starts one process - and therefore one runner - per test.
 
-Each invocation writes its exit code to a file of its own, and the test binary is transferred
-into a directory named after its contents:
+Each invocation writes its exit code to a file named after a random id of its own - hosts and
+containers sharing a device have pids of their own - and the test binary is transferred into a
+directory named after its contents:
 
 ```
 /data/local/tmp/ohos-test-runner/<hash of the binary>/<binary>
 ```
 
-All the invocations of a build therefore share one transfer, instead of pushing the binary again
-for every test, and the transfer of a new build never overwrites a binary another invocation is
-currently executing. The directory of the previous build is removed once the new one arrives.
+All the invocations of a build therefore share its transfer, instead of pushing the binary again
+for every test - only invocations which find the device without the build at the same moment
+transfer it side by side. A transfer never overwrites a binary another invocation is currently
+executing: it arrives under a name of its own and is renamed into place. The directory of the
+previous build is removed once the new one arrives, unless a run which has not ended yet uses it.
+Short-lived changes to the directory, like these, happen under a lock on the device, so that
+concurrent invocations never remove a directory another one has just started to use.
 
 ### Removing the builds from the device
 
 A build stays on the device for as long as the run using it: the `cargo test` or
-`cargo nextest run` process which invokes the runner. The first invocation of a run starts a
-small process of the runner in the background, which waits for the run to end and then removes
-the builds and file mirrors of the run from the device - unless another run still uses them. It
-survives Ctrl-C and tests which time out, so interrupted runs are cleaned up too. This requires a
-Unix host.
+`cargo nextest run` process which invokes the runner, also through a wrapper script. The first
+invocation of a run starts a small process of the runner in the background, which waits for the
+run to end and then removes the builds and file mirrors of the run from the device - unless
+another run still uses them. It survives Ctrl-C and tests which time out, so interrupted runs are
+cleaned up too. This requires a Unix host, and on hosts other than Linux, the runner has to be
+invoked by cargo or nextest directly, or through a wrapper which `exec`s it.
 
 Set `OHOS_TEST_RUNNER_KEEP_BUILDS=1` to keep the builds instead. Running the same build again,
-e.g. with another test filter, then saves the transfer.
+e.g. with another test filter, then saves the transfer. A kept build stays until the collection
+of unused builds removes it, even if later runs use it.
 
 Builds which outlive their run anyway - kept builds, the builds of a run whose cleanup was killed
 or could not reach the device, and the builds of runs on hosts other than Unix - are removed once
@@ -127,8 +134,9 @@ exit code files and half-finished transfers of invocations which were killed.
 `OHOS_TEST_RUNNER_CACHE_TTL_MINUTES` changes that window.
 
 Versions up to 0.1.5 placed the binaries and their exit code files directly in
-`/data/local/tmp/ohos-test-runner`, and never removed them. Those leftovers are not used anymore
-and can be deleted with `hdc shell rm -f /data/local/tmp/ohos-test-runner/last_exit_code-*`.
+`/data/local/tmp/ohos-test-runner`, and never removed them. Those leftovers are not used anymore.
+To remove them, delete the whole directory while no tests run:
+`hdc shell rm -rf /data/local/tmp/ohos-test-runner`.
 
 ### License 
 
