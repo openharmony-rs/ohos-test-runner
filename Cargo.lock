@@ -226,6 +226,7 @@ dependencies = [
  "anyhow",
  "env_logger",
  "hex",
+ "libc",
  "log",
  "md-5",
  "sha2",

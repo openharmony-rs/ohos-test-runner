@@ -108,11 +108,23 @@ All the invocations of a build therefore share one transfer, instead of pushing 
 for every test, and the transfer of a new build never overwrites a binary another invocation is
 currently executing. The directory of the previous build is removed once the new one arrives.
 
-A build is kept only as long as it is being used. Every run marks the build it uses, and a
-transfer - the only moment the directory grows - first removes the builds which have gone unused
-for 30 minutes, along with the exit code files and half-finished transfers of runs which were
-killed. `OHOS_TEST_RUNNER_CACHE_TTL_MINUTES` changes that window; it only has to outlast a single
-`cargo test` or `cargo nextest run`, since a rebuild replaces its build directory anyway.
+### Removing the builds from the device
+
+A build stays on the device for as long as the run using it: the `cargo test` or
+`cargo nextest run` process which invokes the runner. The first invocation of a run starts a
+small process of the runner in the background, which waits for the run to end and then removes
+the builds and file mirrors of the run from the device - unless another run still uses them. It
+survives Ctrl-C and tests which time out, so interrupted runs are cleaned up too. This requires a
+Unix host.
+
+Set `OHOS_TEST_RUNNER_KEEP_BUILDS=1` to keep the builds instead. Running the same build again,
+e.g. with another test filter, then saves the transfer.
+
+Builds which outlive their run anyway - kept builds, the builds of a run whose cleanup was killed
+or could not reach the device, and the builds of runs on hosts other than Unix - are removed once
+they have gone unused for 30 minutes, the next time a build is transferred. That also removes the
+exit code files and half-finished transfers of invocations which were killed.
+`OHOS_TEST_RUNNER_CACHE_TTL_MINUTES` changes that window.
 
 Versions up to 0.1.5 placed the binaries and their exit code files directly in
 `/data/local/tmp/ohos-test-runner`, and never removed them. Those leftovers are not used anymore

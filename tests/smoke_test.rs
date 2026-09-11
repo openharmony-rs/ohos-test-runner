@@ -6,6 +6,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const DEFAULT_OHOS_TARGET: &str = "aarch64-unknown-linux-ohos";
 const FIXTURE_PASSING_CASE: &str = "smoke_passes";
 const FIXTURE_FAILING_CASE: &str = "smoke_fails";
+/// A test which runs long enough to be interrupted.
+const FIXTURE_WAITING_CASE: &str = "smoke_waits";
+/// Keeps the builds of a run on the device, for the tests which look at them after the run.
+const KEEP_BUILDS: (&str, &str) = ("OHOS_TEST_RUNNER_KEEP_BUILDS", "1");
 const EXPECTED_FAILING_EXIT_CODE: &str = "Binary exited with Non-zero code: 101";
 
 #[test]
@@ -148,6 +152,15 @@ fn run_fixture_test_case_with_env(
     test_filter: &str,
     extra_env: &[(&str, &str)],
 ) -> Result<Output, Box<dyn std::error::Error>> {
+    Ok(fixture_test_command(project_dir, test_filter, extra_env)?.output()?)
+}
+
+/// `cargo test` of the fixture in `project_dir`, through the runner.
+fn fixture_test_command(
+    project_dir: &Path,
+    test_filter: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<Command, Box<dyn std::error::Error>> {
     let target = std::env::var("OHOS_TEST_RUNNER_INTEGRATION_TARGET")
         .unwrap_or_else(|_| DEFAULT_OHOS_TARGET.to_owned());
     let runner_env_var = cargo_target_runner_env_var(&target);
@@ -162,8 +175,8 @@ fn run_fixture_test_case_with_env(
         .ok_or("failed to derive fixture test name from temp project directory")?;
 
     let mut cargo = Command::new("cargo");
-    cargo.envs(extra_env.iter().copied());
-    let run = cargo
+    cargo
+        .envs(extra_env.iter().copied())
         .arg("test")
         .arg("--quiet")
         .arg("--target")
@@ -176,9 +189,8 @@ fn run_fixture_test_case_with_env(
         .env(&runner_env_var, env!("CARGO_BIN_EXE_ohos-test-runner"))
         .env(&linker_env_var, linker)
         .env("RUST_LOG", "debug")
-        .current_dir(project_dir)
-        .output()?;
-    Ok(run)
+        .current_dir(project_dir);
+    Ok(cargo)
 }
 
 fn write_smoke_test_fixture(project_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -211,7 +223,7 @@ fn write_smoke_test_fixture_with_marker(
     fs::write(
         project_dir.join("tests").join(format!("{fixture_test_name}.rs")),
         format!(
-            "#[test]\nfn {FIXTURE_PASSING_CASE}() {{\n    println!(\"runner smoke test executed {marker}\");\n}}\n\n#[test]\nfn {FIXTURE_FAILING_CASE}() {{\n    panic!(\"intentional smoke-test failure\");\n}}\n"
+            "#[test]\nfn {FIXTURE_PASSING_CASE}() {{\n    println!(\"runner smoke test executed {marker}\");\n}}\n\n#[test]\nfn {FIXTURE_FAILING_CASE}() {{\n    panic!(\"intentional smoke-test failure\");\n}}\n\n#[test]\nfn {FIXTURE_WAITING_CASE}() {{\n    std::thread::sleep(std::time::Duration::from_secs(30));\n}}\n"
         ),
     )?;
     Ok(())
@@ -293,9 +305,11 @@ const PARALLEL_TEST_COUNT: usize = 16;
 /// this size, and passes it at a tenth of it.
 const PARALLEL_FIXTURE_PADDING: usize = 24_000_000;
 const PARALLEL_JOBS: &str = "8";
-/// How long the exit code files of the other smoke tests, which run concurrently with this one,
-/// are given to disappear.
+/// How long the device is given to be cleaned up after a run: the builds of the run to be removed,
+/// or the exit code files of the other smoke tests, which run concurrently, to disappear.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long building and transferring a fixture may take.
+const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Concurrent invocations of the runner must not overwrite each other's files on the device.
 ///
@@ -313,7 +327,7 @@ fn parallel_nextest_runs_share_one_transfer() -> Result<(), Box<dyn std::error::
     let test_target = parallel_fixture_test_target(project.path())?;
 
     write_parallel_fixture(project.path(), "first build")?;
-    let first_run = run_fixture_with_nextest(project.path(), &test_target)?;
+    let first_run = run_fixture_with_nextest(project.path(), &test_target, &[KEEP_BUILDS])?;
     assert!(
         first_run.status.success(),
         "parallel run through ohos-test-runner failed\nstdout:\n{}\nstderr:\n{}",
@@ -338,7 +352,7 @@ fn parallel_nextest_runs_share_one_transfer() -> Result<(), Box<dyn std::error::
 
     // A rebuild has different contents, so it lands in a new directory and prunes the old one.
     write_parallel_fixture(project.path(), "second build")?;
-    let second_run = run_fixture_with_nextest(project.path(), &test_target)?;
+    let second_run = run_fixture_with_nextest(project.path(), &test_target, &[KEEP_BUILDS])?;
     assert!(
         second_run.status.success(),
         "parallel run of the rebuilt fixture failed\nstdout:\n{}\nstderr:\n{}",
@@ -445,7 +459,7 @@ fn declared_fixtures_are_readable_from_the_test() -> Result<(), Box<dyn std::err
     let run = run_fixture_test_case_with_env(
         project.path(),
         FIXTURE_READING_CASE,
-        &[("OHOS_TEST_RUNNER_FIXTURES", "tests/data")],
+        &[("OHOS_TEST_RUNNER_FIXTURES", "tests/data"), KEEP_BUILDS],
     )?;
     assert!(
         run.status.success(),
@@ -464,6 +478,134 @@ fn declared_fixtures_are_readable_from_the_test() -> Result<(), Box<dyn std::err
 
     for dir in mirrors {
         let _ = hdc_shell(&["rm", "-rf", &format!("{TEST_BIN_DIR}/{dir}")]);
+    }
+    Ok(())
+}
+
+/// When a run ends, its builds and the mirror of its package files leave the device, unless the
+/// run keeps them.
+#[test]
+#[ignore = "requires an OpenHarmony target toolchain, linker setup, hdc, and a connected device"]
+fn builds_are_removed_when_the_run_ends() -> Result<(), Box<dyn std::error::Error>> {
+    let project = TempProject::new()?;
+    let fixture_file = write_fixture_reading_project(project.path())?;
+    let bin_prefix = project.device_bin_prefix().ok_or("no binary name")?;
+    let fixtures = ("OHOS_TEST_RUNNER_FIXTURES", "tests/data");
+
+    let kept = run_fixture_test_case_with_env(
+        project.path(),
+        FIXTURE_READING_CASE,
+        &[fixtures, KEEP_BUILDS],
+    )?;
+    assert!(
+        kept.status.success(),
+        "the run keeping its builds failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&kept.stdout),
+        String::from_utf8_lossy(&kept.stderr)
+    );
+    // Long enough for a cleanup which should not happen to have happened.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        build_dirs_starting_with(&bin_prefix)?.len(),
+        1,
+        "the build was not kept"
+    );
+    assert_eq!(
+        device_dirs_holding(&fixture_file)?.len(),
+        1,
+        "the mirror was not kept"
+    );
+
+    // The same build again, which reuses what the previous run kept, and removes it at its end.
+    let run = run_fixture_test_case_with_env(project.path(), FIXTURE_READING_CASE, &[fixtures])?;
+    assert!(
+        run.status.success(),
+        "the run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    wait_until("the builds of the run are removed", CLEANUP_TIMEOUT, || {
+        Ok(build_dirs_starting_with(&bin_prefix)?.is_empty()
+            && device_dirs_holding(&fixture_file)?.is_empty())
+    })
+}
+
+/// The invocations of a nextest run share its builds, which leave the device once the whole run
+/// ends.
+#[test]
+#[ignore = "requires an OpenHarmony target toolchain, linker setup, hdc, a connected device, and cargo-nextest"]
+fn builds_are_removed_when_a_nextest_run_ends() -> Result<(), Box<dyn std::error::Error>> {
+    if !cargo_nextest_available() {
+        return Err("cargo-nextest is not installed".into());
+    }
+    let project = TempProject::new()?;
+    let test_target = parallel_fixture_test_target(project.path())?;
+    write_parallel_fixture(project.path(), "removed")?;
+
+    let run = run_fixture_with_nextest(project.path(), &test_target, &[])?;
+    assert!(
+        run.status.success(),
+        "parallel run through ohos-test-runner failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    wait_until("the build of the run is removed", CLEANUP_TIMEOUT, || {
+        Ok(build_dirs_of(&test_target)?.is_empty())
+    })
+}
+
+/// Ctrl-C interrupts the whole process group of a command in a terminal, which must not take the
+/// removal of the builds with it.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires an OpenHarmony target toolchain, linker setup, hdc, and a connected device"]
+fn builds_are_removed_after_an_interrupted_run() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let project = TempProject::new()?;
+    write_smoke_test_fixture(project.path())?;
+    let bin_prefix = project.device_bin_prefix().ok_or("no binary name")?;
+
+    let mut run = fixture_test_command(project.path(), FIXTURE_WAITING_CASE, &[])?
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    // Building the fixture comes first, and takes a while.
+    let waited = wait_until("the binary arrives on the device", BUILD_TIMEOUT, || {
+        Ok(!build_dirs_starting_with(&bin_prefix)?.is_empty())
+    });
+    if let Err(err) = waited {
+        let _ = run.kill();
+        return Err(err);
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    let interrupted = Command::new("kill")
+        .args(["-INT", "--", &format!("-{}", run.id())])
+        .status()?;
+    assert!(interrupted.success(), "failed to interrupt the run");
+    assert!(!run.wait()?.success(), "the interrupted run succeeded");
+
+    wait_until(
+        "the build of the interrupted run is removed",
+        CLEANUP_TIMEOUT,
+        || Ok(build_dirs_starting_with(&bin_prefix)?.is_empty()),
+    )
+}
+
+/// Waits for `done` to hold, looking again every 200 ms.
+fn wait_until(
+    what: &str,
+    timeout: Duration,
+    mut done: impl FnMut() -> Result<bool, Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + timeout;
+    while !done()? {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("timed out waiting until {what}").into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
     Ok(())
 }
@@ -554,6 +696,7 @@ fn write_parallel_fixture(
 fn run_fixture_with_nextest(
     project_dir: &Path,
     test_target: &str,
+    extra_env: &[(&str, &str)],
 ) -> Result<Output, Box<dyn std::error::Error>> {
     let target = std::env::var("OHOS_TEST_RUNNER_INTEGRATION_TARGET")
         .unwrap_or_else(|_| DEFAULT_OHOS_TARGET.to_owned());
@@ -564,6 +707,7 @@ fn run_fixture_with_nextest(
     })?;
 
     let run = Command::new("cargo")
+        .envs(extra_env.iter().copied())
         .args(["nextest", "run", "--target"])
         .arg(&target)
         .arg("--test")
