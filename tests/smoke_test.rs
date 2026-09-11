@@ -635,8 +635,15 @@ fn wait_until_no_exit_code_files_are_left() -> Result<(), Box<dyn std::error::Er
     }
 }
 
+/// Runs `hdc shell` against the device the runner uses. Unlike the runner, this passes
+/// `OHOS_TEST_RUNNER_HDC_SERVER` on as it is, so it has to be a numeric address.
 fn hdc_shell(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
     let mut command = Command::new("hdc");
+    if let Ok(server) = std::env::var("OHOS_TEST_RUNNER_HDC_SERVER") {
+        if !server.trim().is_empty() {
+            command.args(["-s", server.trim()]);
+        }
+    }
     if let Ok(device) = std::env::var("OHOS_TEST_RUNNER_HDC_TARGET") {
         if !device.trim().is_empty() {
             command.args(["-t", device.trim()]);
