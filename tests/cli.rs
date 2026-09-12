@@ -207,6 +207,95 @@ fn rejects_a_server_without_a_port_before_calling_hdc() {
     assert!(version.status.success());
 }
 
+/// The watcher of a run removes its builds once the run ends, and not before.
+#[cfg(unix)]
+#[test]
+fn the_watcher_cleans_up_when_the_run_ends() {
+    use std::time::{Duration, Instant};
+
+    let hdc = FakeHdc::new("watcher", "");
+    let mut run = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("failed to start a stand-in for the run");
+    let mut watcher = hdc
+        .runner()
+        .args([
+            "--cleanup-after",
+            &run.id().to_string(),
+            "0123456789abcdef",
+            "cli-test-session",
+        ])
+        .env_remove("OHOS_TEST_RUNNER_HDC_SERVER")
+        .env_remove("OHOS_TEST_RUNNER_HDC_TARGET")
+        .spawn()
+        .expect("failed to start the watcher");
+
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        watcher.try_wait().unwrap().is_none(),
+        "the watcher did not wait for the run"
+    );
+    assert_eq!(
+        hdc.invocations(),
+        "",
+        "the watcher cleaned up during the run"
+    );
+
+    run.kill().unwrap();
+    run.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = watcher.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the watcher did not notice the end of the run"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success());
+    let invocations = hdc.invocations();
+    assert!(
+        invocations.starts_with("shell ") && invocations.contains(".sessions/0123456789abcdef"),
+        "invocations: {invocations}"
+    );
+}
+
+/// The package root would bring the build output along, and cannot be mirrored into itself.
+#[cfg(unix)]
+#[test]
+fn rejects_the_package_root_as_fixture_before_calling_hdc() {
+    let hdc = FakeHdc::new("package-root", UNREACHABLE);
+    let output = hdc
+        .runner()
+        .arg(env!("CARGO_BIN_EXE_ohos-test-runner"))
+        .env("OHOS_TEST_RUNNER_FIXTURES", ".")
+        .env("CARGO_MANIFEST_DIR", env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run ohos-test-runner");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("package root itself"), "stderr: {stderr}");
+    assert_eq!(hdc.invocations(), "");
+}
+
+#[test]
+fn the_watcher_rejects_a_malformed_session_id() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ohos-test-runner"))
+        .args([
+            "--cleanup-after",
+            "4242",
+            "'; rm -rf / #",
+            "cli-test-session",
+        ])
+        .output()
+        .expect("failed to run ohos-test-runner");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid session id"));
+}
+
 #[test]
 fn fails_without_a_binary_argument() {
     let output = Command::new(env!("CARGO_BIN_EXE_ohos-test-runner"))

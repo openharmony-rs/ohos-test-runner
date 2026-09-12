@@ -18,11 +18,16 @@ use anyhow::{bail, Context};
 use log::debug;
 use md5::Md5;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+
+mod session;
+
+use session::{Session, MARKER_TTL_MINUTES, SESSIONS_DIR};
 
 const TEST_BIN_DIR: &str = "/data/local/tmp/ohos-test-runner";
 
@@ -34,12 +39,61 @@ const HDC_SERVER_UNREACHABLE: &str = "Connect server failed";
 /// passed to `-s`.
 const HDC_SERVER_REJECTED: &[&str] = &["-s content IP incorrect.", "-s content port incorrect."];
 
+/// Written to the exit code file when the device turned out not to hold the test binary.
+///
+/// The presence check runs in the same command as the test, so that nothing can collect the
+/// binary between the two. Reporting the miss through the exit code file, which is read anyway,
+/// keeps the output of the test itself untouched.
+const BIN_MISSING: &str = "missing";
+
+/// Marks a build directory, so that the pruning of old builds tells them from the directories
+/// holding the files a test reads.
+const BUILD_MARKER: &str = ".build";
+
+/// Marks a fixture directory whose transfer finished. A directory without it was left behind by
+/// an invocation which was killed, and is transferred again.
+const READY_MARKER: &str = ".ready";
+
+/// Echoed by the probe of the miss path for the parts the device already has.
+const HAVE_BIN_MARKER: &str = "OHOS_TEST_RUNNER_HAVE_BIN";
+const HAVE_FIXTURES_MARKER: &str = "OHOS_TEST_RUNNER_HAVE_FIXTURES";
+const HAVE_LIBRARIES_MARKER: &str = "OHOS_TEST_RUNNER_HAVE_LIBRARIES";
+
+/// The file in [`TEST_BIN_DIR`] whose lock serializes the changes the invocations make to the
+/// directory: using a directory, removing it, and renaming a transfer into place. Transfers and
+/// tests run outside of the lock.
+const DEVICE_LOCK: &str = ".lock";
+
+/// How often a device command tries to take the device lock, 100 ms apart. The lock is only held
+/// for moments, so this only runs out when something is wrong on the device.
+const LOCK_ATTEMPTS: u32 = 600;
+
+/// Echoed, or written to the exit code file, by a device command which could not take the device
+/// lock.
+const LOCK_TIMEOUT_MARKER: &str = "OHOS_TEST_RUNNER_LOCK_TIMEOUT";
+
+/// How long a build stays on the device after its last use, in minutes.
+///
+/// The cache only has to survive one `cargo test` or `cargo nextest run`, which invokes the same
+/// binary many times over seconds to minutes. Anything longer only fills up the device.
+const DEFAULT_CACHE_TTL_MINUTES: u64 = 30;
+
 /// Environment variable to select the device (hdc connect-key) to run the binary on.
 const HDC_TARGET_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_TARGET";
 
 /// Environment variable naming the hdc server (`hdc -s`) to use, as `<host>:<port>`, for a
 /// device attached to another machine.
 const HDC_SERVER_ENV_VAR: &str = "OHOS_TEST_RUNNER_HDC_SERVER";
+
+/// Environment variable listing the files and directories a test reads at runtime, relative to
+/// the package root, in the platform's `PATH` format.
+const FIXTURES_ENV_VAR: &str = "OHOS_TEST_RUNNER_FIXTURES";
+
+/// Environment variable overriding [`DEFAULT_CACHE_TTL_MINUTES`].
+const CACHE_TTL_ENV_VAR: &str = "OHOS_TEST_RUNNER_CACHE_TTL_MINUTES";
+
+/// Environment variable which keeps the builds of a run on the device after the run ends.
+const KEEP_BUILDS_ENV_VAR: &str = "OHOS_TEST_RUNNER_KEEP_BUILDS";
 
 /// Environment variable listing shared libraries which the binary needs at runtime and which
 /// the device does not provide, in the platform's `PATH` format. `cargo-ohos` sets it when the
@@ -55,6 +109,9 @@ const KNOWN_ENV_VARS: &[&str] = &[
     HDC_TARGET_ENV_VAR,
     HDC_SERVER_ENV_VAR,
     RUNTIME_LIBRARIES_ENV_VAR,
+    FIXTURES_ENV_VAR,
+    CACHE_TTL_ENV_VAR,
+    KEEP_BUILDS_ENV_VAR,
 ];
 
 /// Internal environment variables, which are recognized to avoid spurious warnings,
@@ -79,6 +136,16 @@ impl Hdc {
             .transpose()?;
         let target = non_empty_env_var(HDC_TARGET_ENV_VAR);
         Ok(Self { server, target })
+    }
+
+    /// Names the device in the file names of the host, whatever characters the server address
+    /// and connect-key contain.
+    fn device_key(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.server.as_deref().unwrap_or_default());
+        hasher.update([0]);
+        hasher.update(self.target.as_deref().unwrap_or_default());
+        content_id(&hex::encode(hasher.finalize())).to_owned()
     }
 
     /// An hdc command addressing the server, but no particular device.
@@ -107,6 +174,7 @@ impl Hdc {
     /// reach its server.
     fn output(&self, command: &mut Command) -> anyhow::Result<Output> {
         let output = command
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -225,6 +293,114 @@ fn reports(output: &[u8], message: &str) -> bool {
         .any(|line| line.trim() == message)
 }
 
+/// The device-side paths of a single runner invocation.
+///
+/// The binary lives in a directory named after its contents, so that concurrent invocations of
+/// the same build share it, and an invocation of a different build never overwrites a binary
+/// another invocation is currently executing. The files of the invocation itself are named after
+/// a random id, since the hosts and containers sharing a device have pids of their own.
+struct RemotePaths {
+    /// The name of the build directory in [`TEST_BIN_DIR`].
+    bin_id: String,
+    bin_dir: String,
+    bin: String,
+    /// The id of this invocation.
+    nonce: String,
+    exit_code_file: String,
+    /// The name of the mirror of the package root in [`TEST_BIN_DIR`], when the test reads files
+    /// from it.
+    fixtures_id: Option<String>,
+    /// The mirror of the package root. Also the working directory of the test, so that its
+    /// relative paths resolve.
+    fixtures_dir: Option<String>,
+    /// The name of the directory of the runtime libraries in [`TEST_BIN_DIR`], when the binary
+    /// needs some. Named after the libraries, like the build after the binary, so that runs
+    /// needing different versions of a library never load each other's.
+    libraries_id: Option<String>,
+    libraries_dir: Option<String>,
+}
+
+impl RemotePaths {
+    fn new(
+        bin_name: &str,
+        local_sha256: &str,
+        nonce: &str,
+        fixtures_sha256: Option<&str>,
+        libraries_sha256: Option<&str>,
+    ) -> Self {
+        let bin_id = content_id(local_sha256).to_owned();
+        let bin_dir = format!("{TEST_BIN_DIR}/{bin_id}");
+        let fixtures_id = fixtures_sha256.map(|hash| content_id(hash).to_owned());
+        let libraries_id = libraries_sha256.map(|hash| content_id(hash).to_owned());
+        let dir = |id: &Option<String>| id.as_ref().map(|id| format!("{TEST_BIN_DIR}/{id}"));
+        Self {
+            bin: format!("{bin_dir}/{bin_name}"),
+            bin_dir,
+            bin_id,
+            nonce: nonce.to_owned(),
+            exit_code_file: format!("{TEST_BIN_DIR}/exit_code-{nonce}"),
+            fixtures_dir: dir(&fixtures_id),
+            fixtures_id,
+            libraries_dir: dir(&libraries_id),
+            libraries_id,
+        }
+    }
+
+    /// The name `path` is transferred under, before it is renamed into place.
+    fn incoming(&self, path: &str) -> String {
+        format!("{path}.{}.incoming", self.nonce)
+    }
+
+    fn build_marker(&self) -> String {
+        format!("{}/{BUILD_MARKER}", self.bin_dir)
+    }
+
+    fn fixtures_marker(&self) -> Option<String> {
+        self.fixtures_dir
+            .as_ref()
+            .map(|dir| format!("{dir}/{READY_MARKER}"))
+    }
+
+    fn libraries_marker(&self) -> Option<String> {
+        self.libraries_dir
+            .as_ref()
+            .map(|dir| format!("{dir}/{READY_MARKER}"))
+    }
+
+    /// The names of the directories of this invocation in [`TEST_BIN_DIR`]: the build, the
+    /// mirror of the package root, and the runtime libraries.
+    fn dir_names(&self) -> Vec<&str> {
+        std::iter::once(self.bin_id.as_str())
+            .chain(self.fixtures_id.as_deref())
+            .chain(self.libraries_id.as_deref())
+            .collect()
+    }
+
+    /// The directories which arrive complete, by a rename, with the marker which is there once
+    /// they did.
+    fn staged_dirs(&self) -> Vec<(&str, String)> {
+        [
+            (&self.fixtures_dir, self.fixtures_marker()),
+            (&self.libraries_dir, self.libraries_marker()),
+        ]
+        .into_iter()
+        .filter_map(|(dir, marker)| Some((dir.as_deref()?, marker?)))
+        .collect()
+    }
+
+    /// The working directory of the test: the mirror of the package root if there is one, and
+    /// [`TEST_BIN_DIR`] otherwise.
+    fn working_dir(&self) -> &str {
+        self.fixtures_dir.as_deref().unwrap_or(TEST_BIN_DIR)
+    }
+}
+
+/// The part of a hash which names a directory on the device. Long enough that the builds and
+/// fixture sets of one device never collide.
+fn content_id(sha256: &str) -> &str {
+    sha256.get(..16).unwrap_or(sha256)
+}
+
 fn hash_file<D: Digest>(local_bin_path: &Path) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(local_bin_path)?;
     let mut hasher = D::new();
@@ -243,6 +419,42 @@ fn hash_file<D: Digest>(local_bin_path: &Path) -> anyhow::Result<String> {
 
 fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// Wraps the shell `commands` in the device lock. `on_timeout` runs instead of them, before the
+/// device command exits with status 1, if the lock cannot be taken.
+///
+/// The lock is held on file descriptor 9 of the shell for the duration of the group, so nothing
+/// started in `commands` may outlive it. Devices whose toybox has no `flock` run unlocked.
+fn with_device_lock(commands: &str, on_timeout: &str) -> String {
+    format!(
+        "mkdir -p {TEST_BIN_DIR} && {{ \
+         if command -v flock >/dev/null 2>&1; then \
+         attempts=0; \
+         until flock -n 9; do \
+         attempts=$((attempts + 1)); \
+         if [ $attempts -ge {LOCK_ATTEMPTS} ]; then {on_timeout}; exit 1; fi; \
+         sleep 0.1; \
+         done; \
+         fi; \
+         {commands}; \
+         }} 9>>{lock}",
+        lock = shell_quote(&format!("{TEST_BIN_DIR}/{DEVICE_LOCK}")),
+    )
+}
+
+/// A random id for the files of one invocation or session. Unique across the hosts and containers
+/// which share a device, unlike a pid.
+fn random_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+
+    // The keys of a `RandomState` come from the operating system's source of randomness.
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    if let Ok(since_epoch) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        hasher.write_u128(since_epoch.as_nanos());
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 fn ensure_hdc_shell_success(output: &Output, context: &str) -> anyhow::Result<()> {
@@ -308,10 +520,64 @@ fn compute_device_hash(
 
 /// The shared libraries the binary needs on the device, as configured by
 /// [`RUNTIME_LIBRARIES_ENV_VAR`].
-fn runtime_libraries() -> Vec<PathBuf> {
-    match std::env::var_os(RUNTIME_LIBRARIES_ENV_VAR) {
-        Some(value) => parse_runtime_libraries(&value),
-        None => Vec::new(),
+struct RuntimeLibraries {
+    /// Each library with its file name, and the sha256 hash of its contents.
+    libraries: Vec<(PathBuf, String, String)>,
+}
+
+impl RuntimeLibraries {
+    /// The configured libraries, or `None` when the binary needs none.
+    fn from_env() -> anyhow::Result<Option<Self>> {
+        let paths = match std::env::var_os(RUNTIME_LIBRARIES_ENV_VAR) {
+            Some(value) => parse_runtime_libraries(&value),
+            None => Vec::new(),
+        };
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        let mut libraries = Vec::new();
+        for path in paths {
+            if !path.is_file() {
+                bail!(
+                    "Runtime library not found: {}. Check {RUNTIME_LIBRARIES_ENV_VAR}.",
+                    path.display()
+                );
+            }
+            let name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .context("Runtime library names must be utf-8")?
+                .to_owned();
+            let sha256 = hash_file::<Sha256>(&path)?;
+            libraries.push((path, name, sha256));
+        }
+        Self::new(libraries).map(Some)
+    }
+
+    fn new(mut libraries: Vec<(PathBuf, String, String)>) -> anyhow::Result<Self> {
+        libraries.sort_by(|a, b| a.1.cmp(&b.1));
+        if let Some(pair) = libraries.windows(2).find(|pair| pair[0].1 == pair[1].1) {
+            bail!(
+                "{RUNTIME_LIBRARIES_ENV_VAR} names two libraries called {}: {} and {}. They would \
+                 land at the same path on the device.",
+                pair[0].1,
+                pair[0].0.display(),
+                pair[1].0.display()
+            );
+        }
+        Ok(Self { libraries })
+    }
+
+    /// The content id of the set: every name, and the contents behind it.
+    fn hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        for (_, name, sha256) in &self.libraries {
+            hasher.update(name.as_bytes());
+            hasher.update([0]);
+            hasher.update(sha256.as_bytes());
+            hasher.update([0]);
+        }
+        hex::encode(hasher.finalize())
     }
 }
 
@@ -321,95 +587,611 @@ fn parse_runtime_libraries(value: &OsStr) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Sends the runtime libraries next to the binary, so `LD_LIBRARY_PATH` finds them there.
+/// Sends the runtime libraries into a directory of their own, which `LD_LIBRARY_PATH` names.
+fn install_libraries(
+    hdc: &Hdc,
+    libraries: &RuntimeLibraries,
+    remote: &RemotePaths,
+) -> anyhow::Result<()> {
+    let dir = remote
+        .libraries_dir
+        .as_ref()
+        .expect("The libraries have a directory on the device");
+    let entries = libraries
+        .libraries
+        .iter()
+        .map(|(path, name, sha256)| StagedEntry {
+            local: path.clone(),
+            relative: name.clone(),
+            sha256: Some(sha256.clone()),
+        })
+        .collect::<Vec<StagedEntry>>();
+    install_staged(hdc, remote, dir, &entries, &[])
+}
+
+/// The files and directories a test reads at runtime, from [`FIXTURES_ENV_VAR`].
 ///
-/// The libraries are identical for every binary of a `cargo test` run, so skip the transfer
-/// when the device already holds the same file.
-fn send_runtime_libraries_to_device(hdc: &Hdc, libraries: &[PathBuf]) -> anyhow::Result<()> {
-    for library in libraries {
-        if !library.is_file() {
+/// They are mirrored on the device under the package root's relative layout, and the test runs
+/// with that mirror as its working directory, so that its relative paths resolve.
+struct Fixtures {
+    /// The package root on the host, which the device directory mirrors.
+    manifest_dir: PathBuf,
+    /// The declared entries, relative to `manifest_dir`.
+    entries: Vec<PathBuf>,
+}
+
+impl Fixtures {
+    /// The declaration, or `None` when the tests need no files of their own.
+    fn from_env() -> anyhow::Result<Option<Self>> {
+        let Some(value) = std::env::var_os(FIXTURES_ENV_VAR) else {
+            return Ok(None);
+        };
+        let entries = parse_fixture_entries(&value)?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .with_context(|| {
+                format!(
+                    "CARGO_MANIFEST_DIR is unset, so the relative paths in {FIXTURES_ENV_VAR} \
+                     cannot be resolved. Cargo sets it when it runs the target runner."
+                )
+            })?;
+        Ok(Some(Self {
+            manifest_dir,
+            entries,
+        }))
+    }
+}
+
+/// The entries must stay inside the mirror, so absolute paths and `..` are rejected. An absolute
+/// path could not be reproduced on the device anyway: its root filesystem is read-only.
+fn parse_fixture_entries(value: &OsStr) -> anyhow::Result<Vec<PathBuf>> {
+    let mut entries = Vec::new();
+    for entry in std::env::split_paths(value).filter(|path| !path.as_os_str().is_empty()) {
+        if entry.is_absolute() {
             bail!(
-                "Runtime library not found: {}. Check {RUNTIME_LIBRARIES_ENV_VAR}.",
-                library.display()
+                "{FIXTURES_ENV_VAR} takes paths relative to the package root, but `{}` is \
+                 absolute. The device cannot reproduce an absolute host path.",
+                entry.display()
             );
         }
-        let name = library
-            .file_name()
-            .expect("A runtime library must have a filename")
-            .to_str()
-            .context("Runtime library names must be utf-8")?;
-        let on_device_path = format!("{TEST_BIN_DIR}/{name}");
-        if device_file_matches(hdc, library, &on_device_path)? {
-            debug!("The device already has an identical {name}, skipping the transfer");
-            continue;
+        if entry
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            bail!(
+                "{FIXTURES_ENV_VAR} takes paths inside the package root, but `{}` leaves it.",
+                entry.display()
+            );
         }
-        send_file_to_device(hdc, library, &on_device_path, false)
-            .with_context(|| format!("Failed to send the runtime library {name} to the device"))?;
+        // `./tests` is `tests`, and hashes the same.
+        let normalized = entry
+            .components()
+            .filter(|component| !matches!(component, std::path::Component::CurDir))
+            .collect::<PathBuf>();
+        if normalized.as_os_str().is_empty() {
+            bail!(
+                "{FIXTURES_ENV_VAR} names the package root itself, `{}`. Declare the files and \
+                 directories the tests read instead: the package root usually holds the build \
+                 output as well.",
+                entry.display()
+            );
+        }
+        entries.push(normalized);
+    }
+    // An entry inside another one arrives with it. Sending it again would target a directory
+    // which already exists, and nest it.
+    let nested = |entry: &PathBuf| {
+        entries
+            .iter()
+            .any(|other| other != entry && entry.starts_with(other))
+    };
+    let mut outermost = entries
+        .iter()
+        .filter(|entry| !nested(entry))
+        .cloned()
+        .collect::<Vec<PathBuf>>();
+    outermost.sort();
+    outermost.dedup();
+    Ok(outermost)
+}
+
+/// The path of `relative` inside the mirror. The device separates its path components with `/`,
+/// whatever the host does.
+fn device_relative_path(relative: &Path) -> anyhow::Result<String> {
+    let mut components = Vec::new();
+    for component in relative.components() {
+        let part = component
+            .as_os_str()
+            .to_str()
+            .context("Fixture paths must be utf-8")?;
+        components.push(part);
+    }
+    Ok(components.join("/"))
+}
+
+/// What a fixture set consists of.
+struct FixtureContents {
+    /// Every file, relative to the package root.
+    files: Vec<PathBuf>,
+    /// Every directory without a file anywhere below it. hdc cannot transfer those.
+    empty_dirs: Vec<PathBuf>,
+    /// The declared entries which hold files, and so can be sent.
+    sendable: Vec<PathBuf>,
+}
+
+impl Fixtures {
+    fn contents(&self) -> anyhow::Result<FixtureContents> {
+        let mut contents = FixtureContents {
+            files: Vec::new(),
+            empty_dirs: Vec::new(),
+            sendable: Vec::new(),
+        };
+        for entry in &self.entries {
+            if collect_fixture_contents(&self.manifest_dir, entry, &mut contents)? {
+                contents.sendable.push(entry.clone());
+            }
+        }
+        contents.files.sort();
+        contents.files.dedup();
+        contents.empty_dirs.sort();
+        contents.empty_dirs.dedup();
+        Ok(contents)
+    }
+}
+
+/// The content id of the whole fixture set: every relative path and the contents behind it, so
+/// that an edit or a rename lands in a directory of its own. Empty directories count as well,
+/// since a test may rely on them.
+fn hash_fixtures(fixtures: &Fixtures, contents: &FixtureContents) -> anyhow::Result<String> {
+    let mut hasher = Sha256::new();
+    for relative in &contents.files {
+        hasher.update(device_relative_path(relative)?.as_bytes());
+        hasher.update([0]);
+        hasher.update(hash_file::<Sha256>(&fixtures.manifest_dir.join(relative))?.as_bytes());
+        hasher.update([0]);
+    }
+    // A file's path never ends with a slash, so a directory never hashes like a file.
+    for relative in &contents.empty_dirs {
+        hasher.update(device_relative_path(relative)?.as_bytes());
+        hasher.update(b"/\0");
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Collects the files below `relative`, and the directories without any, and returns whether
+/// there were files.
+fn collect_fixture_contents(
+    manifest_dir: &Path,
+    relative: &Path,
+    contents: &mut FixtureContents,
+) -> anyhow::Result<bool> {
+    let path = manifest_dir.join(relative);
+    let metadata = std::fs::metadata(&path).with_context(|| {
+        format!(
+            "Cannot read `{}` from {FIXTURES_ENV_VAR}: {} does not exist",
+            relative.display(),
+            path.display()
+        )
+    })?;
+    if metadata.is_file() {
+        contents.files.push(relative.to_owned());
+        return Ok(true);
+    }
+    let mut has_files = false;
+    for child in std::fs::read_dir(&path)
+        .with_context(|| format!("Failed to read the fixture directory {}", path.display()))?
+    {
+        let child = child?;
+        has_files |=
+            collect_fixture_contents(manifest_dir, &relative.join(child.file_name()), contents)?;
+    }
+    if !has_files {
+        contents.empty_dirs.push(relative.to_owned());
+    }
+    Ok(has_files)
+}
+
+/// Mirrors the fixtures on the device.
+fn install_fixtures(
+    hdc: &Hdc,
+    fixtures: &Fixtures,
+    contents: &FixtureContents,
+    remote: &RemotePaths,
+) -> anyhow::Result<()> {
+    let dir = remote
+        .fixtures_dir
+        .as_ref()
+        .expect("The fixtures have a directory on the device");
+    let mut entries = Vec::new();
+    for entry in &contents.sendable {
+        entries.push(StagedEntry {
+            local: fixtures.manifest_dir.join(entry),
+            relative: device_relative_path(entry)?,
+            sha256: None,
+        });
+    }
+    let empty_dirs = contents
+        .empty_dirs
+        .iter()
+        .map(|dir| device_relative_path(dir))
+        .collect::<anyhow::Result<Vec<String>>>()?;
+    install_staged(hdc, remote, dir, &entries, &empty_dirs)
+}
+
+/// A file or directory to send into a staged directory.
+struct StagedEntry {
+    local: PathBuf,
+    /// The path in the staged directory.
+    relative: String,
+    /// The hash of a file which is verified on the device.
+    sha256: Option<String>,
+}
+
+/// Installs the directory `dir` on the device, complete or not at all.
+///
+/// `hdc file send` nests a directory inside a target directory which already exists, so nothing
+/// is ever sent into `dir` itself: the entries are staged in a fresh directory of this invocation,
+/// which is renamed into place once everything arrived. If another invocation installed `dir` in
+/// the meantime, the staged copy is discarded. hdc cannot send empty directories, so `empty_dirs`
+/// are created on the device.
+fn install_staged(
+    hdc: &Hdc,
+    remote: &RemotePaths,
+    dir: &str,
+    entries: &[StagedEntry],
+    empty_dirs: &[String],
+) -> anyhow::Result<()> {
+    let staging = remote.incoming(dir);
+
+    // `hdc file send` creates the directories a transferred directory needs, but not the ones a
+    // single file needs, so create every parent up front - in one command, whatever the number
+    // of entries. Never the entries themselves, which the transfers create.
+    let mut parents = BTreeSet::from([staging.clone()]);
+    for entry in entries {
+        let target = format!("{staging}/{}", entry.relative);
+        if let Some((parent, _)) = target.rsplit_once('/') {
+            parents.insert(parent.to_owned());
+        }
+    }
+    let mkdir = format!(
+        "mkdir -p {}",
+        parents
+            .iter()
+            .map(|dir| shell_quote(dir))
+            .collect::<Vec<String>>()
+            .join(" ")
+    );
+    ensure_hdc_shell_success(
+        &hdc.shell(&[&mkdir])?,
+        "Failed to create the directories on device",
+    )?;
+
+    for entry in entries {
+        let target = format!("{staging}/{}", entry.relative);
+        send_file_to_device(hdc, &entry.local, &target)
+            .and_then(|()| match &entry.sha256 {
+                Some(sha256) => verify_device_file(hdc, &entry.local, &target, sha256),
+                None => Ok(()),
+            })
+            .with_context(|| format!("Failed to send {} to the device", entry.local.display()))?;
+    }
+
+    let output = hdc.shell(&[&install_staged_command(&staging, dir, empty_dirs)])?;
+    ensure_hdc_shell_success(&output, "Failed to move the files into place on device")?;
+    ensure_device_lock_taken(&output)
+}
+
+/// Creates the empty directories, marks the staged directory complete and renames it into place,
+/// unless another invocation installed a complete `dir` first. A directory without the marker
+/// was left behind by a runner up to 0.1.5, which transferred into it directly, and is replaced.
+fn install_staged_command(staging: &str, dir: &str, empty_dirs: &[String]) -> String {
+    let mut commands = String::new();
+    if !empty_dirs.is_empty() {
+        commands.push_str("mkdir -p");
+        for empty_dir in empty_dirs {
+            commands.push(' ');
+            commands.push_str(&shell_quote(&format!("{staging}/{empty_dir}")));
+        }
+        commands.push_str(" && ");
+    }
+    let marker = shell_quote(&format!("{dir}/{READY_MARKER}"));
+    let staging = shell_quote(staging);
+    let dir = shell_quote(dir);
+    commands.push_str(&format!(
+        "touch {staging}/{ready} && \
+         if [ -e {marker} ]; then rm -rf {staging}; \
+         else rm -rf {dir} && mv -T {staging} {dir}; fi",
+        ready = shell_quote(READY_MARKER),
+    ));
+    with_device_lock(&commands, &format!("echo {LOCK_TIMEOUT_MARKER}"))
+}
+
+/// What the device is still missing, having created the directories the transfers need.
+struct DeviceState {
+    has_bin: bool,
+    has_fixtures: bool,
+    has_libraries: bool,
+}
+
+fn probe_device(
+    hdc: &Hdc,
+    remote: &RemotePaths,
+    session: &Session,
+    ttl_minutes: u64,
+) -> anyhow::Result<DeviceState> {
+    let output = hdc.shell(&[&probe_command(remote, session, ttl_minutes)])?;
+    ensure_hdc_shell_success(&output, "Failed to inspect the device")?;
+    ensure_device_lock_taken(&output)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(DeviceState {
+        has_bin: has_marker(&stdout, HAVE_BIN_MARKER),
+        has_fixtures: remote.fixtures_dir.is_none() || has_marker(&stdout, HAVE_FIXTURES_MARKER),
+        has_libraries: remote.libraries_dir.is_none() || has_marker(&stdout, HAVE_LIBRARIES_MARKER),
+    })
+}
+
+/// Collects the unused builds, creates the build directory the transfer needs, and marks the
+/// directories as used by the session before anything arrives in them. One command under the
+/// device lock, so that neither the collection nor the end of another session can remove them
+/// in between.
+fn probe_command(remote: &RemotePaths, session: &Session, ttl_minutes: u64) -> String {
+    let mut command = format!(
+        "{}; mkdir -p {bin_dir} && touch -c {bin_dir} && {}",
+        collect_garbage_command(ttl_minutes),
+        session.mark_command(&remote.dir_names()),
+        bin_dir = shell_quote(&remote.bin_dir),
+    );
+    command.push_str(&format!(
+        "; [ -x {} ] && echo {HAVE_BIN_MARKER}",
+        shell_quote(&remote.bin)
+    ));
+    for (marker, echo) in [
+        (remote.fixtures_marker(), HAVE_FIXTURES_MARKER),
+        (remote.libraries_marker(), HAVE_LIBRARIES_MARKER),
+    ] {
+        if let Some(marker) = marker {
+            command.push_str(&format!("; [ -e {} ] && echo {echo}", shell_quote(&marker)));
+        }
+    }
+    command.push_str("; true");
+    with_device_lock(&command, &format!("echo {LOCK_TIMEOUT_MARKER}"))
+}
+
+/// `hdc shell` reports success even when the command it ran failed, so the answer is the output.
+fn has_marker(stdout: &str, marker: &str) -> bool {
+    stdout.lines().any(|line| line.trim() == marker)
+}
+
+fn ensure_device_lock_taken(output: &Output) -> anyhow::Result<()> {
+    if has_marker(
+        &String::from_utf8_lossy(&output.stdout),
+        LOCK_TIMEOUT_MARKER,
+    ) {
+        bail!(
+            "Timed out waiting for the lock on the device ({TEST_BIN_DIR}/{DEVICE_LOCK}). Another \
+             invocation of the runner holds it."
+        );
     }
     Ok(())
 }
 
-/// Whether the device holds a file with the same contents as `local_path`.
+/// The command which runs the test binary on the device, if the device still has it.
 ///
-/// `hdc shell` reports success even when the command it ran failed, so anything which does not
-/// parse as a hash - a missing file, a missing hash tool - counts as "no" and leads to a
-/// transfer.
-fn device_file_matches(hdc: &Hdc, local_path: &Path, on_device_path: &str) -> anyhow::Result<bool> {
-    let output = hdc.shell(&["sha256sum", on_device_path])?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let Ok(device_hash) = parse_device_hash_output(&stdout) else {
-        return Ok(false);
+/// Under the device lock, the presence check marks the directories as used - by the session, and
+/// for the collection of unused builds - so that nothing can remove them once the check passed.
+/// The test runs outside of the lock. A miss is reported through the exit code file, so that the
+/// output of the test itself stays untouched.
+fn run_command(remote: &RemotePaths, args: &[String], session: &Session) -> String {
+    let mut present = format!("[ -x {} ]", shell_quote(&remote.bin));
+    let mut touch = format!("touch -c {}", shell_quote(&remote.bin_dir));
+    for (dir, marker) in remote.staged_dirs() {
+        present.push_str(&format!(" && [ -e {} ]", shell_quote(&marker)));
+        touch.push(' ');
+        touch.push_str(&shell_quote(dir));
+    }
+    let exit_code_file = shell_quote(&remote.exit_code_file);
+    let check = with_device_lock(
+        &format!(
+            "if {present} && {touch} && {}; then present=1; fi",
+            session.mark_command(&remote.dir_names())
+        ),
+        &format!("printf '%s' {LOCK_TIMEOUT_MARKER} > {exit_code_file}"),
+    );
+
+    let mut run = format!("cd {} && ", shell_quote(remote.working_dir()));
+    if let Some(dir) = &remote.libraries_dir {
+        // The binary needs libraries the device does not provide, and musl searches neither
+        // the working directory nor the directory of the binary.
+        run.push_str(&format!("LD_LIBRARY_PATH={} ", shell_quote(dir)));
+    }
+    if let Some(dir) = &remote.fixtures_dir {
+        // Tests which read CARGO_MANIFEST_DIR at runtime find the mirror. The `env!` form bakes
+        // the host path into the binary and cannot be helped: the device's root filesystem is
+        // read-only, so that path can never exist there.
+        run.push_str(&format!("CARGO_MANIFEST_DIR={} ", shell_quote(dir)));
+    }
+    run.push_str(&shell_quote(&remote.bin));
+    for arg in args {
+        run.push(' ');
+        run.push_str(&shell_quote(arg));
+    }
+    format!(
+        "present=0; {check}; \
+         if [ $present = 1 ]; then {run}; printf '%s' \"$?\" > {exit_code_file}; \
+         else printf '%s' {missing} > {exit_code_file}; fi",
+        missing = shell_quote(BIN_MISSING),
+    )
+}
+
+/// Removes the builds which have not been used for `ttl_minutes`, and the files left behind by
+/// invocations which were killed. Part of the probe, so that the device directory is collected
+/// whenever it is about to grow. A directory marked by a run which has not ended yet stays, even
+/// if a single test has kept it busy for longer than that.
+fn collect_garbage_command(ttl_minutes: u64) -> String {
+    format!(
+        "cd {TEST_BIN_DIR} && \
+         find {sessions} -mindepth 2 -maxdepth 2 -type f -mmin +{MARKER_TTL_MINUTES} \
+         -exec rm -f {{}} + 2>/dev/null; \
+         rmdir {sessions}/* 2>/dev/null; \
+         for dir in $(find . -mindepth 1 -maxdepth 1 -type d ! -name '.*' -mmin +{ttl_minutes}); do \
+         name=\"${{dir#./}}\"; \
+         {marked} || {{ rm -rf \"$name\"; rm -f {sessions}/*/\"$name\"; }}; \
+         done; \
+         find . -mindepth 1 -maxdepth 1 -name 'exit_code-*' -mmin +{ttl_minutes} \
+         -exec rm -f {{}} + ; \
+         find . -mindepth 1 -maxdepth 2 -type f -name '*.incoming' -mmin +{ttl_minutes} \
+         -exec rm -f {{}} +",
+        sessions = SESSIONS_DIR,
+        marked = session::marked_by_a_run(),
+    )
+}
+
+/// Whether the builds of the run stay on the device after it, from [`KEEP_BUILDS_ENV_VAR`].
+fn keep_builds() -> bool {
+    match non_empty_env_var(KEEP_BUILDS_ENV_VAR)
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("0" | "false" | "no" | "off") => false,
+        Some("1" | "true" | "yes" | "on") => true,
+        Some(other) => {
+            eprintln!("warning: `{KEEP_BUILDS_ENV_VAR}` is `{other}`, which is neither 1 nor 0");
+            false
+        }
+    }
+}
+
+/// How long an unused build stays on the device, from [`CACHE_TTL_ENV_VAR`].
+fn cache_ttl_minutes() -> u64 {
+    parse_cache_ttl(std::env::var_os(CACHE_TTL_ENV_VAR).as_deref())
+}
+
+fn parse_cache_ttl(value: Option<&OsStr>) -> u64 {
+    let Some(value) = value else {
+        return DEFAULT_CACHE_TTL_MINUTES;
     };
-    Ok(device_hash == hash_file::<Sha256>(local_path)?)
+    match value.to_str().map(str::trim).map(str::parse::<u64>) {
+        Some(Ok(minutes)) => minutes,
+        _ => {
+            eprintln!(
+                "warning: `{CACHE_TTL_ENV_VAR}` is not a number of minutes, using \
+                 {DEFAULT_CACHE_TTL_MINUTES}"
+            );
+            DEFAULT_CACHE_TTL_MINUTES
+        }
+    }
 }
 
-/// Sends the binary at `local_bin_path` to the device.
-fn send_bin_to_device(
+/// Installs the binary at `remote.bin`.
+///
+/// The binary is transferred under a temporary name and then renamed into place, because a
+/// concurrent invocation may be executing the file at `remote.bin`: overwriting a running binary
+/// fails with `Text file busy`, while replacing it by a rename is fine.
+fn install_bin_on_device(
     hdc: &Hdc,
     local_bin_path: &Path,
-    on_device_bin_path: &str,
+    remote: &RemotePaths,
+    local_sha256: &str,
 ) -> anyhow::Result<()> {
-    send_file_to_device(hdc, local_bin_path, on_device_bin_path, true)
+    let incoming = remote.incoming(&remote.bin);
+    send_file_to_device(hdc, local_bin_path, &incoming)?;
+
+    let command = format!(
+        "chmod +x {} && touch {}",
+        shell_quote(&incoming),
+        shell_quote(&remote.build_marker())
+    );
+    let output = hdc.shell(&[&command])?;
+    ensure_hdc_shell_success(&output, "Failed to mark test binary executable on device")?;
+
+    verify_device_file(hdc, local_bin_path, &incoming, local_sha256)?;
+
+    let output = hdc.shell(&["mv", "-f", &incoming, &remote.bin])?;
+    ensure_hdc_shell_success(
+        &output,
+        "Failed to move the test binary into place on device",
+    )
 }
 
-fn send_file_to_device(
-    hdc: &Hdc,
-    local_bin_path: &Path,
-    on_device_bin_path: &str,
-    executable: bool,
-) -> anyhow::Result<()> {
-    let output = hdc.shell(&["mkdir", "-p", TEST_BIN_DIR])?;
-    ensure_hdc_shell_success(&output, "Failed to create test directory on device")?;
+/// Removes the directories holding other builds of the same binary, unless a run which has not
+/// ended yet uses them.
+///
+/// Only called after a transfer, i.e. once per build, and best-effort: a failure here costs
+/// space, not correctness.
+fn prune_other_builds(hdc: &Hdc, bin_name: &str, remote: &RemotePaths) {
+    let command = prune_other_builds_command(bin_name, remote);
+    match hdc.shell(&[&command]) {
+        Ok(output) if !output.status.success() => log::warn!(
+            "Failed to remove the directories of other builds of {bin_name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(err) => {
+            log::warn!("Failed to remove the directories of other builds of {bin_name}: {err}")
+        }
+        Ok(_) => {}
+    }
+}
 
+fn prune_other_builds_command(bin_name: &str, remote: &RemotePaths) -> String {
+    // The marker keeps the directories mirroring the files a test reads out of this: one of
+    // them could well hold a file named like the test binary.
+    with_device_lock(
+        &format!(
+            "cd {TEST_BIN_DIR} && \
+             for dir in */; do \
+             name=\"${{dir%/}}\"; \
+             if [ \"$name\" != {} ] && [ -e \"$name\"/{} ] && [ -e \"$name\"/{} ] \
+             && ! {}; \
+             then rm -rf \"$name\"; rm -f {SESSIONS_DIR}/*/\"$name\"; fi; \
+             done",
+            shell_quote(&remote.bin_id),
+            shell_quote(BUILD_MARKER),
+            shell_quote(bin_name),
+            session::marked_by_a_run(),
+        ),
+        "true",
+    )
+}
+
+/// Sends `local_path` to `on_device_path`. The parent directory must already exist, and for a
+/// directory, `on_device_path` must not: hdc would nest the directory inside it.
+fn send_file_to_device(hdc: &Hdc, local_path: &Path, on_device_path: &str) -> anyhow::Result<()> {
     let res = hdc.output(
         hdc.command()
             .args(["file", "send"])
-            .arg(local_bin_path)
-            .arg(TEST_BIN_DIR),
+            .arg(local_path)
+            .arg(on_device_path),
     )?;
-    assert!(res.status.success());
+    ensure_hdc_shell_success(&res, "hdc file send")?;
     // Captured to recognize an unreachable server, but meant for the user.
     eprint!("{}", String::from_utf8_lossy(&res.stderr));
+    // A failed transfer, e.g. into a directory which does not exist, prints `[Fail]...` - with
+    // exit status 0, like every other failure of hdc.
     if !res.stdout.starts_with(b"FileTransfer finish") {
-        // Don't bail for now, we still verify the file hash below anyway.
-        log::warn!("Unexpected output from hdc. File transfer may have failed.");
+        bail!(
+            "hdc could not send {} to {on_device_path}: {}",
+            local_path.display(),
+            String::from_utf8_lossy(&res.stdout).trim()
+        );
     }
+    Ok(())
+}
 
-    if executable {
-        let output = hdc.shell(&["chmod", "+x", on_device_bin_path])?;
-        ensure_hdc_shell_success(&output, "Failed to mark test binary executable on device")?;
-    }
-
-    let sha256_hash = hash_file::<Sha256>(local_bin_path)?;
-    let md5_hash = hash_file::<Md5>(local_bin_path)?;
-    debug!("The local sha256 hash is {sha256_hash:?}");
-    debug!("The local md5 hash is {md5_hash:?}");
-
-    let device_hash = if let Some(hash) = compute_device_hash(hdc, "sha256sum", on_device_bin_path)?
-    {
-        ("sha256sum", sha256_hash, hash)
-    } else if let Some(hash) = compute_device_hash(hdc, "md5sum", on_device_bin_path)? {
-        ("md5sum", md5_hash, hash)
+/// Checks that the transferred file arrived intact, using the strongest hash tool the device has.
+fn verify_device_file(
+    hdc: &Hdc,
+    local_path: &Path,
+    on_device_path: &str,
+    local_sha256: &str,
+) -> anyhow::Result<()> {
+    debug!("The local sha256 hash is {local_sha256:?}");
+    let device_hash = if let Some(hash) = compute_device_hash(hdc, "sha256sum", on_device_path)? {
+        ("sha256sum", local_sha256.to_owned(), hash)
+    } else if let Some(hash) = compute_device_hash(hdc, "md5sum", on_device_path)? {
+        ("md5sum", hash_file::<Md5>(local_path)?, hash)
     } else {
         bail!("Neither sha256sum nor md5sum is available on the device");
     };
@@ -421,6 +1203,38 @@ fn send_file_to_device(
         );
     }
     Ok(())
+}
+
+/// Runs `command` on the device, letting the output of the test through to the caller.
+///
+/// We don't really know how long the test program would run, so we can't set a reasonable
+/// timeout. We just fallback to using hdc shell as a command again.
+fn run_on_device(hdc: &Hdc, command: &str) -> anyhow::Result<()> {
+    let res = hdc
+        .command()
+        .arg("shell")
+        .arg(command)
+        .spawn()
+        .expect("Failed to run hdc")
+        .wait()
+        .expect("Failed to get output of hdc");
+    if !res.success() {
+        bail!("Non zero exit code from hdc: {res}");
+    }
+    Ok(())
+}
+
+/// Reads the exit code the run left on the device, removing the file as it does.
+///
+/// Removing it here leaves the invocations which are killed before this point as the only ones
+/// which leave anything behind.
+fn read_exit_code(hdc: &Hdc, remote: &RemotePaths) -> anyhow::Result<String> {
+    let exit_code_file = shell_quote(&remote.exit_code_file);
+    let res = hdc.shell(&[&format!("cat {exit_code_file}; rm -f {exit_code_file}")])?;
+    if !res.status.success() {
+        bail!("Non zero exit code from hdc: {res:?}");
+    }
+    Ok(String::from_utf8_lossy(&res.stdout).into_owned())
 }
 
 /// Checks that the requested device - or the only connected device, if none was requested -
@@ -509,8 +1323,29 @@ Environment variables:
         the devices attached to the other machine.
     {RUNTIME_LIBRARIES_ENV_VAR}
         Shared libraries the binary needs but the device does not provide, separated like
-        `PATH`. They are sent next to the binary and found via `LD_LIBRARY_PATH`.
-        `cargo-ohos` sets this when the toolchain carries its own C++ runtime.
+        `PATH`. They are sent into a directory named after their contents, which
+        `LD_LIBRARY_PATH` names, so that runs needing different versions of a library never
+        load each other's. `cargo-ohos` sets this when the toolchain carries its own C++
+        runtime.
+    {FIXTURES_ENV_VAR}
+        Files and directories the tests read at runtime, relative to the package root and
+        separated like `PATH`. They are mirrored on the device in the same layout, empty
+        directories included, and the test runs with that mirror as its working directory,
+        so relative paths resolve. The package root itself (`.`) cannot be declared.
+        Tests which read `CARGO_MANIFEST_DIR` at runtime see the mirror as well; the
+        `env!(CARGO_MANIFEST_DIR)` form bakes the host path into the binary and cannot
+        be supported, since the device's root filesystem is read-only.
+    {KEEP_BUILDS_ENV_VAR}
+        Set to `1` to keep the builds on the device after the run. By default, the runner
+        removes the builds and file mirrors of a `cargo test` or `cargo nextest run` from
+        the device when that process exits, unless another run still uses them. Kept
+        builds save the transfer when the same build runs again, and stay until they are
+        collected as unused.
+    {CACHE_TTL_ENV_VAR}
+        How many minutes a build which outlives its run stays on the device after its last
+        use ({ttl} by default). That is a kept build, and a build whose run could not remove
+        it, e.g. because the run was killed or the device disconnected. It is collected
+        once it goes unused for this long, when the next build is transferred.
     RUST_LOG
         Log level of the runner itself, e.g. `debug`.
 
@@ -523,6 +1358,7 @@ Example:
         name = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
+        ttl = DEFAULT_CACHE_TTL_MINUTES,
     );
 }
 
@@ -545,6 +1381,22 @@ fn main() -> anyhow::Result<()> {
             print_help();
             return Ok(());
         }
+        // Not for users: the first invocation of a run starts the runner like this, to remove
+        // the builds of the run from the device once it ends.
+        Some(session::WATCH_FLAG) => {
+            let (Some(owner), Some(id), Some(lock)) = (args.next(), args.next(), args.next())
+            else {
+                bail!(
+                    "{} takes the pid of the run, a session id and a session file",
+                    session::WATCH_FLAG
+                );
+            };
+            return session::watch(
+                &owner.to_string_lossy(),
+                &id.to_string_lossy(),
+                &lock.to_string_lossy(),
+            );
+        }
         _ => {}
     }
     let hdc = Hdc::from_env()?;
@@ -563,62 +1415,88 @@ fn main() -> anyhow::Result<()> {
     if !bin_path.exists() {
         bail!("Binary not found: {}", bin_path.display());
     }
-    let bin_name = bin_path.file_name().expect("Test bin must have a filename");
-    let on_device_bin_path = format!("{TEST_BIN_DIR}/{}", bin_name.to_str().expect("utf-8"));
+    let bin_name = bin_path
+        .file_name()
+        .expect("Test bin must have a filename")
+        .to_str()
+        .expect("utf-8");
+    let local_sha256 = hash_file::<Sha256>(bin_path)?;
+    let fixtures = Fixtures::from_env()?;
+    let fixture_contents = fixtures.as_ref().map(Fixtures::contents).transpose()?;
+    let fixtures_sha256 = fixtures
+        .as_ref()
+        .zip(fixture_contents.as_ref())
+        .map(|(fixtures, contents)| hash_fixtures(fixtures, contents))
+        .transpose()?;
+    let libraries = RuntimeLibraries::from_env()?;
+    let libraries_sha256 = libraries.as_ref().map(RuntimeLibraries::hash);
+    let remote = RemotePaths::new(
+        bin_name,
+        &local_sha256,
+        &random_id(),
+        fixtures_sha256.as_deref(),
+        libraries_sha256.as_deref(),
+    );
     debug!("Bin_path: {:?}", bin_path);
+    debug!(
+        "On device: {}, exit code file: {}",
+        remote.bin, remote.exit_code_file
+    );
 
     let targets = hdc.list_targets()?;
     check_device_selection(&targets, hdc.target.as_deref())?;
 
-    send_bin_to_device(&hdc, bin_path, &on_device_bin_path)
-        .context("Failed to send binary to device")?;
+    let session = session::join(keep_builds());
 
-    let runtime_libraries = runtime_libraries();
-    send_runtime_libraries_to_device(&hdc, &runtime_libraries)?;
+    let command = run_command(&remote, &remaining_args, &session);
+    let mut transferred = false;
+    let exit_code = loop {
+        run_on_device(&hdc, &command)?;
+        let exit_code = read_exit_code(&hdc, &remote)?;
+        if exit_code.trim() == LOCK_TIMEOUT_MARKER {
+            bail!(
+                "Timed out waiting for the lock on the device ({TEST_BIN_DIR}/{DEVICE_LOCK}). \
+                 Another invocation of the runner holds it."
+            );
+        }
+        if exit_code.trim() != BIN_MISSING {
+            break exit_code;
+        }
+        if transferred {
+            bail!("The test binary disappeared from the device before it could be run");
+        }
+        // Another invocation on this host may be transferring the same files right now: wait for
+        // it, and find them on the device.
+        let _transfers = session::lock_transfers(&hdc.device_key(), &remote.dir_names());
+        let state = probe_device(&hdc, &remote, &session, cache_ttl_minutes())?;
+        if !state.has_bin {
+            debug!("The device does not have {}, transferring it", remote.bin);
+            install_bin_on_device(&hdc, bin_path, &remote, &local_sha256)
+                .context("Failed to send binary to device")?;
+            prune_other_builds(&hdc, bin_name, &remote);
+        }
+        if !state.has_fixtures {
+            let (fixtures, contents) = fixtures
+                .as_ref()
+                .zip(fixture_contents.as_ref())
+                .expect("Only a declared fixture set can be missing");
+            debug!("The device does not have the fixtures, transferring them");
+            install_fixtures(&hdc, fixtures, contents, &remote)
+                .context("Failed to send the fixtures to device")?;
+        }
+        if !state.has_libraries {
+            let libraries = libraries
+                .as_ref()
+                .expect("Only declared runtime libraries can be missing");
+            debug!("The device does not have the runtime libraries, transferring them");
+            install_libraries(&hdc, libraries, &remote)
+                .context("Failed to send the runtime libraries to device")?;
+        }
+        transferred = true;
+    };
 
-    let exit_code_file = format!(
-        "{}/last_exit_code-{}",
-        TEST_BIN_DIR,
-        bin_name.to_str().expect("utf-8")
-    );
-    let output = hdc.shell(&["rm", "-f", &exit_code_file])?;
-    ensure_hdc_shell_success(&output, "Failed to clear device exit code file")?;
-
-    // We don't really know how long the test program would run, so we can't set a reasonable
-    // timeout. We just fallback to using hdc shell as a command again.
-    let mut command = format!("cd {} && ", shell_quote(TEST_BIN_DIR));
-    if !runtime_libraries.is_empty() {
-        // The binary needs libraries the device does not provide, and musl searches neither
-        // the working directory nor the directory of the binary.
-        command.push_str(&format!("LD_LIBRARY_PATH={} ", shell_quote(TEST_BIN_DIR)));
-    }
-    command.push_str(&shell_quote(&on_device_bin_path));
-    for arg in &remaining_args {
-        command.push(' ');
-        command.push_str(&shell_quote(arg));
-    }
-    command.push_str("; printf '%s' \"$?\" > ");
-    command.push_str(&shell_quote(&exit_code_file));
-
-    let res = hdc
-        .command()
-        .arg("shell")
-        .arg(&command)
-        .spawn()
-        .expect("Failed to run hdc")
-        .wait()
-        .expect("Failed to get output of hdc");
-    if !res.success() {
-        bail!("Non zero exit code from hdc: {res}");
-    }
-
-    let res = hdc.shell(&["cat", &exit_code_file])?;
-    if !res.status.success() {
-        bail!("Non zero exit code from hdc: {res:?}");
-    }
-    let stdout = String::from_utf8_lossy(&res.stdout);
-    if stdout.trim() != "0" {
-        bail!("Binary exited with Non-zero code: {stdout}");
+    if exit_code.trim() != "0" {
+        bail!("Binary exited with Non-zero code: {exit_code}");
     }
 
     Ok(())
@@ -627,11 +1505,17 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_device_selection, hash_tool_missing, parse_device_hash_output,
-        parse_runtime_libraries, reports, resolve_server, unknown_env_vars, Hdc,
-        HDC_SERVER_REJECTED, HDC_SERVER_UNREACHABLE,
+        check_device_selection, collect_garbage_command, has_marker, hash_fixtures,
+        hash_tool_missing, install_staged_command, parse_cache_ttl, parse_device_hash_output,
+        parse_fixture_entries, parse_runtime_libraries, probe_command, prune_other_builds_command,
+        random_id, reports, resolve_server, run_command, session, unknown_env_vars,
+        with_device_lock, Fixtures, Hdc, RemotePaths, RuntimeLibraries, Session, BIN_MISSING,
+        BUILD_MARKER, DEFAULT_CACHE_TTL_MINUTES, DEVICE_LOCK, HDC_SERVER_REJECTED,
+        HDC_SERVER_UNREACHABLE, LOCK_ATTEMPTS, LOCK_TIMEOUT_MARKER, MARKER_TTL_MINUTES,
+        TEST_BIN_DIR,
     };
-    use std::ffi::OsString;
+    use std::collections::BTreeSet;
+    use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
     #[test]
@@ -769,6 +1653,26 @@ mod tests {
     }
 
     #[test]
+    fn the_device_key_names_the_server_and_the_device() {
+        let hdc = |server: Option<&str>, target: Option<&str>| Hdc {
+            server: server.map(str::to_owned),
+            target: target.map(str::to_owned),
+        };
+        let local = hdc(None, Some("127.0.0.1:5555")).device_key();
+        assert_eq!(local.len(), 16);
+        assert!(
+            local.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{local}"
+        );
+        assert_eq!(local, hdc(None, Some("127.0.0.1:5555")).device_key());
+        assert_ne!(local, hdc(None, Some("127.0.0.1:5556")).device_key());
+        assert_ne!(
+            local,
+            hdc(Some("10.0.0.2:8710"), Some("127.0.0.1:5555")).device_key()
+        );
+    }
+
+    #[test]
     fn parses_md5_device_hash_output() {
         let output = "0123456789abcdef0123456789abcdef  /tmp/bin\n";
         assert_eq!(
@@ -781,5 +1685,461 @@ mod tests {
     fn detects_toybox_missing_hash_tool() {
         let output = "toybox: Unknown command sha256sum (see \"toybox --help\")\n";
         assert!(hash_tool_missing(output, "sha256sum"));
+    }
+
+    const HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const HASH_B: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    const NONCE_A: &str = "aaaaaaaaaaaaaaaa";
+    const NONCE_B: &str = "bbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn remote_paths_are_shared_per_build_and_private_per_invocation() {
+        let first = RemotePaths::new("crate-tests", HASH_A, NONCE_A, None, None);
+        let second = RemotePaths::new("crate-tests", HASH_A, NONCE_B, None, None);
+        let other_build = RemotePaths::new("crate-tests", HASH_B, NONCE_A, None, None);
+
+        // Two invocations of the same build reuse the transferred binary ...
+        assert_eq!(first.bin, second.bin);
+        // ... but must not write each other's exit code, or transfer over each other.
+        assert_ne!(first.exit_code_file, second.exit_code_file);
+        assert_ne!(first.incoming(&first.bin), second.incoming(&second.bin));
+        // A different build is transferred next to it, never over it.
+        assert_ne!(first.bin_dir, other_build.bin_dir);
+        assert_ne!(first.bin, other_build.bin);
+        assert_ne!(first.bin, first.incoming(&first.bin));
+
+        for path in [&first.bin_dir, &first.bin, &first.exit_code_file] {
+            assert!(path.starts_with(&format!("{TEST_BIN_DIR}/")), "{path}");
+        }
+        assert!(first.bin.ends_with("/crate-tests"), "{}", first.bin);
+    }
+
+    #[test]
+    fn invocation_ids_differ() {
+        let ids = (0..100).map(|_| random_id()).collect::<BTreeSet<String>>();
+        assert_eq!(ids.len(), 100);
+        assert!(ids.iter().all(|id| id.len() == 16), "{ids:?}");
+    }
+
+    #[test]
+    fn the_run_command_checks_for_the_binary_and_marks_it_under_the_lock() {
+        let remote = RemotePaths::new("crate-tests", HASH_A, NONCE_A, None, None);
+        let command = run_command(
+            &remote,
+            &["--exact".to_owned(), "a::b".to_owned()],
+            &Session::keep(),
+        );
+        let (check, run) = command
+            .split_once(&format!("9>>'{TEST_BIN_DIR}/{DEVICE_LOCK}'"))
+            .expect("the check runs under the device lock");
+
+        // Nothing may remove the binary between the check and the run, ...
+        assert!(check.contains("flock -n 9"), "{command}");
+        assert!(
+            check.contains(&format!("if [ -x '{}' ]", remote.bin)),
+            "{command}"
+        );
+        // ... since the check marks the build as still in use, without creating anything, ...
+        assert!(
+            check.contains(&format!("touch -c '{}'", remote.bin_dir)),
+            "{command}"
+        );
+        assert!(
+            check.contains(&format!(".sessions/keep/{}'", remote.bin_id)),
+            "{command}"
+        );
+        // ... and the test runs outside of the lock.
+        assert!(run.contains("'--exact' 'a::b'"), "{command}");
+        assert!(!run.contains("flock"), "{command}");
+        assert!(
+            run.contains(&format!("> '{}'", remote.exit_code_file)),
+            "{command}"
+        );
+        // A miss is reported through the exit code file, so that the output of the test itself
+        // stays untouched.
+        assert!(run.contains(&format!("'{BIN_MISSING}'")), "{command}");
+        assert!(
+            command.contains(&format!("printf '%s' {LOCK_TIMEOUT_MARKER} >")),
+            "{command}"
+        );
+        assert!(!command.contains("LD_LIBRARY_PATH"), "{command}");
+    }
+
+    #[test]
+    fn the_runtime_libraries_have_a_directory_of_their_own() {
+        let remote = RemotePaths::new("crate-tests", HASH_A, NONCE_A, None, Some(HASH_B));
+        let libraries_dir = remote.libraries_dir.clone().expect("declared");
+        let command = run_command(&remote, &[], &Session::keep());
+
+        assert_eq!(libraries_dir, format!("{TEST_BIN_DIR}/fedcba9876543210"));
+        assert!(
+            command.contains(&format!("LD_LIBRARY_PATH='{libraries_dir}'")),
+            "{command}"
+        );
+        // The test only starts once the libraries arrived complete, and they count as in use.
+        assert!(
+            command.contains(&format!("[ -e '{libraries_dir}/.ready' ]")),
+            "{command}"
+        );
+        assert!(
+            command.contains(".sessions/keep/fedcba9876543210'"),
+            "{command}"
+        );
+        assert!(!run_command(
+            &RemotePaths::new("crate-tests", HASH_A, NONCE_A, None, None),
+            &[],
+            &Session::keep()
+        )
+        .contains("LD_LIBRARY_PATH"));
+    }
+
+    #[test]
+    fn a_new_version_of_a_library_gets_a_directory_of_its_own() {
+        let libraries = |sha256: &str| {
+            RuntimeLibraries::new(vec![(
+                PathBuf::from("/sdk/libc++_shared.so"),
+                "libc++_shared.so".to_owned(),
+                sha256.to_owned(),
+            )])
+            .unwrap()
+            .hash()
+        };
+        assert_eq!(libraries(HASH_A), libraries(HASH_A));
+        assert_ne!(libraries(HASH_A), libraries(HASH_B));
+    }
+
+    #[test]
+    fn two_libraries_with_the_same_name_are_rejected() {
+        let library = |dir: &str| {
+            (
+                PathBuf::from(format!("/{dir}/libc++_shared.so")),
+                "libc++_shared.so".to_owned(),
+                HASH_A.to_owned(),
+            )
+        };
+        assert!(RuntimeLibraries::new(vec![library("a"), library("b")]).is_err());
+    }
+
+    #[test]
+    fn garbage_collection_covers_builds_and_the_files_of_killed_invocations() {
+        let command = collect_garbage_command(30);
+
+        assert!(
+            command.contains("-type d ! -name '.*' -mmin +30"),
+            "{command}"
+        );
+        assert!(
+            command.contains("-name 'exit_code-*' -mmin +30"),
+            "{command}"
+        );
+        assert!(
+            command.contains("-type f -name '*.incoming' -mmin +30"),
+            "{command}"
+        );
+        // The runtime libraries sit next to the build directories and are not collected.
+        assert!(!command.contains("-name '*.so'"), "{command}");
+        // A directory an ongoing run has marked stays, and markers nobody removed expire.
+        assert!(
+            command.contains(&format!("{} || {{ rm -rf", session::marked_by_a_run())),
+            "{command}"
+        );
+        assert!(
+            command.contains(&format!("-mmin +{MARKER_TTL_MINUTES}")),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn the_cache_ttl_falls_back_to_the_default() {
+        assert_eq!(parse_cache_ttl(Some(OsStr::new(" 5 "))), 5);
+        assert_eq!(parse_cache_ttl(None), DEFAULT_CACHE_TTL_MINUTES);
+        assert_eq!(
+            parse_cache_ttl(Some(OsStr::new("half an hour"))),
+            DEFAULT_CACHE_TTL_MINUTES
+        );
+        assert_eq!(
+            parse_cache_ttl(Some(OsStr::new("-1"))),
+            DEFAULT_CACHE_TTL_MINUTES
+        );
+    }
+
+    #[test]
+    fn fixture_entries_must_stay_inside_the_package() {
+        assert_eq!(
+            parse_fixture_entries(&std::env::join_paths(["tests/data", "fixture.json"]).unwrap())
+                .unwrap(),
+            [PathBuf::from("fixture.json"), PathBuf::from("tests/data")]
+        );
+        // The device's root filesystem is read-only, so an absolute host path is hopeless, and
+        // a path leaving the package root has nowhere to land in the mirror.
+        assert!(parse_fixture_entries(OsStr::new("/etc/hosts")).is_err());
+        assert!(parse_fixture_entries(OsStr::new("../sibling/data")).is_err());
+    }
+
+    #[test]
+    fn the_fixture_hash_ignores_the_order_of_the_entries() {
+        let project = unit_fixture_project("order", &[("a/one.txt", "1"), ("b/two.txt", "2")]);
+        let hash_of = |entries: Vec<PathBuf>| {
+            let fixtures = Fixtures {
+                manifest_dir: project.clone(),
+                entries,
+            };
+            hash_fixtures(&fixtures, &fixtures.contents().unwrap()).unwrap()
+        };
+
+        assert_eq!(
+            hash_of(vec![PathBuf::from("a"), PathBuf::from("b")]),
+            hash_of(vec![PathBuf::from("b"), PathBuf::from("a")])
+        );
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn the_fixture_hash_follows_the_contents_and_the_names() {
+        let base = unit_fixture_project("contents", &[("data/one.txt", "1")]);
+        let edited = unit_fixture_project("edited", &[("data/one.txt", "2")]);
+        let renamed = unit_fixture_project("renamed", &[("data/uno.txt", "1")]);
+        let hash_of = |dir: &PathBuf| {
+            let fixtures = Fixtures {
+                manifest_dir: dir.clone(),
+                entries: vec![PathBuf::from("data")],
+            };
+            hash_fixtures(&fixtures, &fixtures.contents().unwrap()).unwrap()
+        };
+
+        assert_ne!(hash_of(&base), hash_of(&edited), "an edit must be noticed");
+        assert_ne!(
+            hash_of(&base),
+            hash_of(&renamed),
+            "a rename must be noticed"
+        );
+
+        for dir in [base, edited, renamed] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn the_session_marks_the_directories_it_uses() {
+        let session = Session::with_id("0123456789abcdef", false);
+        let remote = RemotePaths::new("crate-tests", HASH_A, NONCE_A, Some(HASH_B), None);
+        let fixtures_id = remote.fixtures_id.clone().expect("declared");
+        let run = run_command(&remote, &[], &session);
+        let probe = probe_command(&remote, &session, 30);
+
+        let marks = format!(
+            "touch '{TEST_BIN_DIR}/.sessions/0123456789abcdef/{}' \
+             '{TEST_BIN_DIR}/.sessions/0123456789abcdef/{fixtures_id}'",
+            remote.bin_id
+        );
+        for command in [&run, &probe] {
+            assert!(command.contains(&marks), "{command}");
+        }
+        // The run marks the directories before the test starts, and the probe before anything
+        // is transferred into them, so nothing can remove them meanwhile.
+        let marked = |command: &str| command.find(&marks).expect("marked");
+        assert!(marked(&run) < run.find("cd '").expect("cd"), "{run}");
+        assert!(
+            marked(&probe) < probe.find("echo OHOS_TEST_RUNNER_HAVE_BIN").expect("probe"),
+            "{probe}"
+        );
+    }
+
+    #[test]
+    fn the_probe_collects_before_it_prepares_the_build_directory() {
+        let remote = RemotePaths::new("crate-tests", HASH_A, NONCE_A, None, None);
+        let probe = probe_command(&remote, &Session::keep(), 30);
+
+        assert!(probe.contains("flock -n 9"), "{probe}");
+        // `mkdir -p` leaves the time of an existing directory alone, which the collection would
+        // take for unused.
+        let collected = probe.find("-mmin +30").expect("collects");
+        let prepared = probe
+            .find(&format!("mkdir -p '{}' && touch -c", remote.bin_dir))
+            .expect("prepares");
+        assert!(collected < prepared, "{probe}");
+        // The mirror of the package files only ever arrives complete, by a rename.
+        assert!(!probe.contains(&format!("{TEST_BIN_DIR}/{}'", HASH_B.get(..16).unwrap())));
+    }
+
+    #[test]
+    fn staged_directories_are_renamed_into_place_complete() {
+        let command = install_staged_command("/d/F.n.incoming", "/d/F", &[]);
+
+        assert!(command.contains("flock -n 9"), "{command}");
+        assert!(
+            command.contains("touch '/d/F.n.incoming'/'.ready'"),
+            "{command}"
+        );
+        // A complete mirror which another invocation installed first stays, and `mv -T` never
+        // moves into an existing directory.
+        assert!(
+            command.contains("if [ -e '/d/F/.ready' ]; then rm -rf '/d/F.n.incoming'"),
+            "{command}"
+        );
+        assert!(
+            command.contains("mv -T '/d/F.n.incoming' '/d/F'"),
+            "{command}"
+        );
+
+        // hdc cannot send empty directories, so they are created before the rename.
+        let command = install_staged_command("/d/F.n.incoming", "/d/F", &["a/empty".to_owned()]);
+        let created = command
+            .find("mkdir -p '/d/F.n.incoming/a/empty'")
+            .expect("creates the empty directory");
+        assert!(
+            created < command.find("mv -T").expect("renames"),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn the_run_command_uses_the_fixtures_as_the_working_directory() {
+        let remote = RemotePaths::new("crate-tests", HASH_A, NONCE_A, Some(HASH_B), None);
+        let fixtures_dir = remote.fixtures_dir.clone().expect("declared");
+        let command = run_command(&remote, &[], &Session::keep());
+
+        // The test only runs once the whole fixture set arrived, ...
+        assert!(
+            command.contains(&format!("[ -e '{fixtures_dir}/.ready' ]")),
+            "{command}"
+        );
+        // ... its relative paths resolve against the mirror, ...
+        assert!(
+            command.contains(&format!("cd '{fixtures_dir}'")),
+            "{command}"
+        );
+        assert!(
+            command.contains(&format!("CARGO_MANIFEST_DIR='{fixtures_dir}'")),
+            "{command}"
+        );
+        // ... and both directories count as in use.
+        assert!(
+            command.contains(&format!("touch -c '{}' '{fixtures_dir}'", remote.bin_dir)),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn detects_a_probe_marker() {
+        // hdc terminates the lines of a shell command with CRLF.
+        assert!(has_marker("[Fail]a notice\r\nMARK\r\n", "MARK"));
+        assert!(!has_marker("", "MARK"));
+        assert!(!has_marker("sh: echo MARK: not found\r\n", "MARK"));
+    }
+
+    /// A package root holding `files`, given as (path relative to it, contents).
+    fn unit_fixture_project(name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ohos-test-runner-unit-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, contents) in files {
+            let file = dir.join(path);
+            std::fs::create_dir_all(file.parent().expect("a fixture file has a parent")).unwrap();
+            std::fs::write(file, contents).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn pruning_quotes_the_binary_name_and_keeps_the_builds_in_use() {
+        let remote = RemotePaths::new("odd name'; rm -rf /", HASH_A, NONCE_A, None, None);
+        let command = prune_other_builds_command("odd name'; rm -rf /", &remote);
+
+        assert!(command.contains(r"'odd name'\''; rm -rf /'"), "{command}");
+        // A directory mirroring the files a test reads could hold a file named like the test
+        // binary, so a build is recognized by its marker as well.
+        assert!(command.contains(&format!("'{BUILD_MARKER}'")), "{command}");
+        assert!(
+            command.contains(&format!("!= '{}'", remote.bin_id)),
+            "{command}"
+        );
+        assert!(
+            command.contains(&format!("! {}", session::marked_by_a_run())),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn empty_fixture_directories_count() {
+        let base = unit_fixture_project("empty-base", &[("data/one.txt", "1")]);
+        let with_empty = unit_fixture_project("empty-with", &[("data/one.txt", "1")]);
+        std::fs::create_dir_all(with_empty.join("data/empty/deeper")).unwrap();
+        std::fs::create_dir_all(with_empty.join("out")).unwrap();
+        let fixtures = |dir: &PathBuf| Fixtures {
+            manifest_dir: dir.clone(),
+            entries: vec![PathBuf::from("data"), PathBuf::from("out")],
+        };
+        std::fs::create_dir_all(base.join("out")).unwrap();
+
+        let contents = fixtures(&with_empty).contents().unwrap();
+        assert_eq!(contents.files, [PathBuf::from("data/one.txt")]);
+        assert_eq!(
+            contents.empty_dirs,
+            [
+                PathBuf::from("data/empty"),
+                PathBuf::from("data/empty/deeper"),
+                PathBuf::from("out")
+            ]
+        );
+        // An entry without files cannot be sent - hdc refuses an empty directory - and is
+        // created instead.
+        assert_eq!(contents.sendable, [PathBuf::from("data")]);
+
+        let hash = |dir: &PathBuf| {
+            let fixtures = fixtures(dir);
+            hash_fixtures(&fixtures, &fixtures.contents().unwrap()).unwrap()
+        };
+        assert_ne!(
+            hash(&base),
+            hash(&with_empty),
+            "an empty directory must be noticed"
+        );
+
+        for dir in [base, with_empty] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn the_package_root_is_no_fixture() {
+        assert!(parse_fixture_entries(OsStr::new(".")).is_err());
+        assert!(parse_fixture_entries(OsStr::new("./")).is_err());
+        assert_eq!(
+            parse_fixture_entries(OsStr::new("./tests/./data")).unwrap(),
+            [PathBuf::from("tests/data")]
+        );
+    }
+
+    #[test]
+    fn nested_fixture_entries_are_sent_with_their_parent() {
+        let entries =
+            std::env::join_paths(["tests/data", "tests", "b", "tests/data/x", "b"]).unwrap();
+        assert_eq!(
+            parse_fixture_entries(&entries).unwrap(),
+            [PathBuf::from("b"), PathBuf::from("tests")]
+        );
+    }
+
+    #[test]
+    fn the_lock_runs_the_commands_or_the_timeout_action() {
+        let command = with_device_lock("echo inside", "echo timeout");
+        assert!(
+            command.ends_with(&format!(
+                "echo inside; }} 9>>'{TEST_BIN_DIR}/{DEVICE_LOCK}'"
+            )),
+            "{command}"
+        );
+        assert!(
+            command.contains(&format!(
+                "if [ $attempts -ge {LOCK_ATTEMPTS} ]; then echo timeout; exit 1; fi"
+            )),
+            "{command}"
+        );
+        // Devices without flock run unlocked.
+        assert!(command.contains("if command -v flock"), "{command}");
     }
 }

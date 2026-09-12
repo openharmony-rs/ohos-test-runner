@@ -221,11 +221,12 @@ checksum = "78ca9ab1a0babb1e7d5695e3530886289c18cf2f87ec19a575a0abdce112e3a3"
 
 [[package]]
 name = "ohos-test-runner"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "env_logger",
  "hex",
+ "libc",
  "log",
  "md-5",
  "sha2",

@@ -29,20 +29,30 @@ cargo test --target aarch64-unknown-linux-ohos
 The example assumes that you already have a working build environment to cross-compile your project
 for OpenHarmony.
 
-### Limitations
+### Files used by tests
 
-Tests run on-device, which means that tests which have assumptions about the filesystem contents may break.
-This is commonly the case for tests that reference resources from files checked in the local project, which
-won't exist on the device. There is no way for a test runner to know about such files, but potentially in
-the future we could add some configuration options to allow pushing some files or directories with the
-executable onto the device, so relative paths referenced from tests can resolve.
+Tests run on-device and `ohos-test-runner` cannot know which files a test opens.
+If your test or benchmark needs files, declare them in `OHOS_TEST_RUNNER_FIXTURES`. 
+Paths should be relative to the package root and separated like `PATH`.
+Both files and directories (including empty ones) are supported, but not the package root itself.
+
+```
+export OHOS_TEST_RUNNER_FIXTURES=tests/data:benches/corpus
+cargo test --target aarch64-unknown-linux-ohos
+```
+
+`ohos-test-runner` will set the working directory, so relative paths such as `tests/data/input.json` 
+resolve same when running tests on the host. 
+Reading `CARGO_MANIFEST_DIR` at runtime, with `std::env::var` works too, however `env!("CARGO_MANIFEST_DIR")`,
+and any other absolute host path can't be supported. 
+
+Currently only reading files is supported, transferring potential output files back to the host is currently not
+planned (but may be added if the need arises).
 
 ### Selecting a device
 
 If more than one device is attached, the device must be selected via the
 `OHOS_TEST_RUNNER_HDC_TARGET` environment variable, which is passed to `hdc` as the `-t` argument.
-Since cargo invokes the runner with the test binary and its arguments only, the device can't be
-selected via a command line argument.
 
 ```
 # List the connect-keys of the attached devices
@@ -56,12 +66,13 @@ With a single attached device the variable is optional and can be left unset.
 
 ### Using a device attached to another machine
 
-The device does not have to be attached to the machine running `cargo test`. hdc runs a server
-on the machine the device is attached to, and `OHOS_TEST_RUNNER_HDC_SERVER` points the runner at
-it, like `hdc -s` does. Typically, that is the end of an SSH tunnel from that machine:
+`hdc` runs a server on the machine the device is attached to, and `OHOS_TEST_RUNNER_HDC_SERVER` 
+can be used to point the runner at this remote instance (internally uses `hdc -s`).
+Typically, that would be a port forwarded via ssh, unless the remote machine is in the same network.
 
 ```
-export OHOS_TEST_RUNNER_HDC_SERVER=127.0.0.1:8710
+# Assuming a remote hdc port was forward to out 48710 port.
+export OHOS_TEST_RUNNER_HDC_SERVER=127.0.0.1:48710
 cargo test --target aarch64-unknown-linux-ohos
 ```
 
@@ -71,9 +82,28 @@ share no files. Unlike `hdc -s`, the variable accepts host names.
 [docs/remote-device.md](docs/remote-device.md) describes the setup, including a build running in
 a Docker container.
 
+### Diagnostics
+
 Environment variables starting with `OHOS_TEST_RUNNER` which are not known to the installed version
 are reported with a warning, since they are likely typos, or configuration for a newer version of
 this tool. Run `ohos-test-runner --help` for the list of supported variables.
+
+### Running tests in parallel
+
+Several runner invocations may run concurrently (concurrent test execution).
+`ohos-test-runner` supports this, but as a trade-off disk utilization is increased,
+due to preserving test executables on device (`cargo nextest` may invoke the same test binary
+multiple times).
+`ohos-test-runner` does best-effort to prune test files again and return disk space.
+A small background process is spawned for this purpose to cleanup files after a while on
+the device.
+As a fallabck builds are removed once they have been unused for 30 minutes, 
+the next time a build is transferred. 
+
+Versions up to 0.1.5 placed the binaries and their exit code files directly in
+`/data/local/tmp/ohos-test-runner`, and never removed them. Those leftovers are not used anymore.
+To remove them, delete the whole directory while no tests run:
+`hdc shell rm -rf /data/local/tmp/ohos-test-runner`.
 
 ### License 
 
