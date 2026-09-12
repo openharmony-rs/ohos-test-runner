@@ -6,6 +6,7 @@ rust-version = "1.85"
 license = "Apache-2.0"
 description = "Support running cargo test / run / bench on OpenHarmony devices."
 repository = "https://github.com/openharmony-rs/ohos-test-runner"
+exclude = ["emulator-action/"]
 
 [dependencies]
 anyhow = "1.0.97"
