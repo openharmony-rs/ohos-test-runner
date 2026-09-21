@@ -66,8 +66,12 @@ jobs:
           echo "$(dirname "${OHOS_SDK_NATIVE}")/toolchains" >> "$GITHUB_PATH"
         env:
           OHOS_SDK_NATIVE: ${{ steps.setup_sdk.outputs.ohos_sdk_native }}
-      # The parallel smoke test drives the runner through `cargo nextest`.
       - uses: taiki-e/install-action@nextest
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
       - name: Start Oniro emulator
         uses: openharmony-rs/emulator-action@v1
       - name: Run OHOS smoke test
