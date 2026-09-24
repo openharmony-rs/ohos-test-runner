@@ -168,7 +168,6 @@ jobs:
           else
             cargo publish --locked --no-verify
           fi
-      # Only now, as the checkout above empties the workspace.
       - uses: actions/download-artifact@v8
         with:
           pattern: ohos-test-runner-*
@@ -176,7 +175,6 @@ jobs:
           merge-multiple: true
       # The provenance names this run's commit as the source, which a manual run from another
       # ref than the tag did not build.
-      - if: github.sha == env.SHA
         uses: actions/attest@v4
         with:
           subject-path: dist/*
