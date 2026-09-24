@@ -8,6 +8,11 @@ description = "Support running cargo test / run / bench on OpenHarmony devices."
 repository = "https://github.com/openharmony-rs/ohos-test-runner"
 exclude = ["emulator-action/"]
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [dependencies]
 anyhow = "1.0.97"
 md-5 = "0.11.0"

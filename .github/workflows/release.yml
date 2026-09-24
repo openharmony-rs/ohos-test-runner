@@ -86,6 +86,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       TARGET: ${{ matrix.target }}
+      # Keep in sync with `package.metadata.binstall` in `Cargo.toml`
       ARCHIVE: ohos-test-runner-${{ matrix.target }}.tar.gz
     steps:
       - uses: actions/checkout@v7
