@@ -18,7 +18,9 @@ After installing ohos-test-runner, configure your project to use the custom
 target runner, for the relevant target triple, e.g.
 
 ```
-# Install ohos-test-runner
+# Install ohos-test-runner (prebuilt binaries are available for Linux and Apple Silicon macOS)
+cargo binstall ohos-test-runner
+# or build it from source
 cargo install --locked ohos-test-runner
 # Setup ohos-test-runner as the target runner for e.g. aarch64 OpenHarmony.
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_RUNNER=ohos-test-runner
@@ -104,6 +106,13 @@ Versions up to 0.1.5 placed the binaries and their exit code files directly in
 `/data/local/tmp/ohos-test-runner`, and never removed them. Those leftovers are not used anymore.
 To remove them, delete the whole directory while no tests run:
 `hdc shell rm -rf /data/local/tmp/ohos-test-runner`.
+
+### Releasing
+
+Bump the version in `Cargo.toml` and merge the change into `main`. The `Release` workflow then
+builds the binaries and, in the `release` environment, tags the commit as `v<version>`, publishes
+the crate to crates.io and publishes the GitHub release with the binaries attached.
+If a release did not complete, run the `Release` workflow manually for its tag to finish it.
 
 ### License 
 
