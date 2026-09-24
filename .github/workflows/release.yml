@@ -137,11 +137,6 @@ jobs:
       SHA: ${{ needs.check.outputs.sha }}
       PUBLISH: ${{ needs.check.outputs.publish }}
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: ohos-test-runner-*
-          path: dist
-          merge-multiple: true
       - name: Create tag
         run: |
           if tag_sha=$(gh api "repos/${GH_REPO}/commits/tags/${TAG}" --jq .sha 2>/dev/null); then
@@ -172,6 +167,12 @@ jobs:
           else
             cargo publish --locked --no-verify
           fi
+      # Only now, as the checkout above empties the workspace.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ohos-test-runner-*
+          path: dist
+          merge-multiple: true
       - name: Publish GitHub release
         run: |
           if ! draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
