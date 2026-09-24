@@ -1,0 +1,185 @@
+name: Release
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to finish or backfill the release for, e.g. v0.1.6
+        required: true
+
+jobs:
+  # Decides with a read-only token whether anything needs to be released, so that
+  # the privileged `release` job only runs (and asks for approval) when it does.
+  check:
+    name: Check release state
+    if: github.repository_owner == 'openharmony-rs'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check crates.io, tag and GitHub release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "ohos-test-runner").version')
+          tag="v${version}"
+          sha=$(git rev-parse HEAD)
+          if [[ -n "$INPUT_TAG" && "$INPUT_TAG" != "$tag" ]]; then
+            echo "::error::Cargo.toml at ${INPUT_TAG} has version ${version}"
+            exit 1
+          fi
+          status=$(curl -sS -o /dev/null -w '%{http_code}' -A 'ohos-test-runner release workflow' \
+            "https://crates.io/api/v1/crates/ohos-test-runner/${version}")
+          case "$status" in
+            200) publish=false ;;
+            404) publish=true ;;
+            *) echo "::error::Unexpected crates.io response: HTTP ${status}"; exit 1 ;;
+          esac
+          if [[ -z "$INPUT_TAG" && "$publish" == false ]]; then
+            echo "${version} is already on crates.io, nothing to release"
+            exit 0
+          fi
+          tag_sha=$(git ls-remote origin "refs/tags/${tag}" "refs/tags/${tag}^{}" | tail -n1 | cut -f1)
+          if [[ -n "$tag_sha" && "$tag_sha" != "$sha" ]]; then
+            echo "::error::Tag ${tag} points to ${tag_sha}, not ${sha}"
+            exit 1
+          fi
+          if [[ "$publish" == false && "$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" == false ]]; then
+            echo "Release ${tag} is already published, nothing to release"
+            exit 0
+          fi
+          {
+            echo "tag=${tag}"
+            echo "sha=${sha}"
+            echo "publish=${publish}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check
+    if: needs.check.outputs.tag
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCHIVE: ohos-test-runner-${{ matrix.target }}.tar.gz
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target "$TARGET"
+      - run: tar -czf "$ARCHIVE" -C "target/${TARGET}/release" ohos-test-runner
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  # The privileged job publishes with `--no-verify`, so the package is verified here.
+  package:
+    name: Verify crate package
+    needs: check
+    if: needs.check.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package --locked
+
+  # The only job with write access. It builds nothing and only runs in the `release`
+  # environment. The GitHub release is published last, as immutable releases can't be
+  # changed afterwards.
+  release:
+    name: Release ${{ needs.check.outputs.tag }}
+    needs: [check, build, package]
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      # crates.io trusted publishing
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.check.outputs.tag }}
+      SHA: ${{ needs.check.outputs.sha }}
+      PUBLISH: ${{ needs.check.outputs.publish }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ohos-test-runner-*
+          path: dist
+          merge-multiple: true
+      - name: Create tag
+        run: |
+          if tag_sha=$(gh api "repos/${GH_REPO}/commits/tags/${TAG}" --jq .sha 2>/dev/null); then
+            if [[ "$tag_sha" != "$SHA" ]]; then
+              echo "::error::Tag ${TAG} points to ${tag_sha}, not ${SHA}"
+              exit 1
+            fi
+          else
+            gh api "repos/${GH_REPO}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${SHA}" --silent
+          fi
+      - if: env.PUBLISH == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SHA }}
+          persist-credentials: false
+      - if: env.PUBLISH == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      # Uses the runner's preinstalled cargo instead of a toolchain action, to keep this job's actions minimal.
+      - name: Publish to crates.io
+        if: env.PUBLISH == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          if curl -sSf -o /dev/null -A 'ohos-test-runner release workflow' \
+              "https://crates.io/api/v1/crates/ohos-test-runner/${TAG#v}"; then
+            echo "${TAG#v} is already on crates.io"
+          else
+            cargo publish --locked --no-verify
+          fi
+      - name: Publish GitHub release
+        run: |
+          if ! draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            gh release create "$TAG" --draft --verify-tag --generate-notes dist/*
+          elif [[ "$draft" == true ]]; then
+            gh release upload "$TAG" --clobber dist/*
+          else
+            echo "::notice::Release ${TAG} is already published"
+            exit 0
+          fi
+          gh release edit "$TAG" --draft=false
