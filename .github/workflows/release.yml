@@ -128,8 +128,9 @@ jobs:
     environment: release
     permissions:
       contents: write
-      # crates.io trusted publishing
+      # crates.io trusted publishing, and signing the build provenance
       id-token: write
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -137,11 +138,6 @@ jobs:
       SHA: ${{ needs.check.outputs.sha }}
       PUBLISH: ${{ needs.check.outputs.publish }}
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: ohos-test-runner-*
-          path: dist
-          merge-multiple: true
       - name: Create tag
         run: |
           if tag_sha=$(gh api "repos/${GH_REPO}/commits/tags/${TAG}" --jq .sha 2>/dev/null); then
@@ -172,6 +168,16 @@ jobs:
           else
             cargo publish --locked --no-verify
           fi
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ohos-test-runner-*
+          path: dist
+          merge-multiple: true
+      # The provenance names this run's commit as the source, which a manual run from another
+      # ref than the tag did not build.
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*
       - name: Publish GitHub release
         run: |
           if ! draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
