@@ -111,8 +111,14 @@ To remove them, delete the whole directory while no tests run:
 
 Bump the version in `Cargo.toml` and merge the change into `main`. The `Release` workflow then
 builds the binaries and, in the `release` environment, tags the commit as `v<version>`, publishes
-the crate to crates.io and publishes the GitHub release with the binaries attached.
-If a release did not complete, run the `Release` workflow manually for its tag to finish it.
+the crate to crates.io and publishes the GitHub release with the binaries attached, together
+with their build provenance attestation.
+If a release did not complete, run the `Release` workflow manually for its tag to finish it. Run
+it from the tag itself, as the binaries are only attested when the workflow runs from the commit
+it builds.
+
+The attestation of a downloaded binary can be checked with
+`gh attestation verify ohos-test-runner-<target>.tar.gz --repo openharmony-rs/ohos-test-runner`.
 
 ### License 
 

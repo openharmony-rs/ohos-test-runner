@@ -128,8 +128,9 @@ jobs:
     environment: release
     permissions:
       contents: write
-      # crates.io trusted publishing
+      # crates.io trusted publishing, and signing the build provenance
       id-token: write
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -173,6 +174,12 @@ jobs:
           pattern: ohos-test-runner-*
           path: dist
           merge-multiple: true
+      # The provenance names this run's commit as the source, which a manual run from another
+      # ref than the tag did not build.
+      - if: github.sha == env.SHA
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*
       - name: Publish GitHub release
         run: |
           if ! draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
